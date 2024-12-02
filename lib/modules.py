@@ -1,7 +1,7 @@
 from torch import nn
 from torch.nn import functional as F
 
-from .Utils import *
+from .utils import *
 
 
 class Module(nn.Module, Base):
@@ -15,7 +15,7 @@ class Module(nn.Module, Base):
     # Defaults for classification are used and should likely be overridden
 
     def loss(self, outputs, y):
-        loss = F.mse_loss(outputs.squeeze(), y.squeeze(), reduction="mean")
+        loss = F.mse_loss(outputs, y.reshape(outputs.shape), reduction="mean")
         return loss
 
     def forward(self, X):
@@ -28,70 +28,49 @@ class Module(nn.Module, Base):
         param_str = "__".join([f"{k}_{v}" for k, v in self.p.items()])
         return f"{self.__class__.__name__}_{param_str}"
 
-
-class Classifier(Module):
-    """
-    The base class of classification models.
-
-    Defined in :numref:`sec_classification`
-    """
-
-    def accuracy(self, outputs, Y, averaged=True):
-        """
-        Compute the number of correct predictions.
-
-        Defined in :numref:`sec_classification`
-        """
-        outputs = torch.reshape(outputs, (-1, outputs.shape[-1]))
-        preds = torch.argmax(outputs, axis=1)
-        compare = torch.astype(preds == torch.reshape(Y, -1), torch.float32)
-        return torch.reduce_mean(compare) if averaged else compare
-
-    def loss(self, outputs, Y, averaged=True):
-        """Defined in :numref:`sec_softmax_concise`"""
-        outputs = outputs.reshape(-1, outputs.shape[-1])
-        Y = Y.reshape(
-            -1,
-        )
-        return F.cross_entropy(outputs, Y, reduction="mean" if averaged else "none")
-
-    # For metrics
-    def _pred(output):
-        F.argmax(dim=1)
+    def pred(self, output):
+        return output
 
     def layer_summary(self, X_shape):
-        """Defined in :numref:`sec_lenet`"""
+        """Displays model output dimensions for each layer given input X-shape.
+
+        Args:
+            X_shape (tuple)
+        """
         X = torch.randn(*X_shape)
         for layer in self.net:
             X = layer(X)
             print(layer.__class__.__name__, "output shape:\t", X.shape)
 
 
-class MultiClassifier(Module):
+class Classifier(Module):
     """
     The base class of classification models.
-
-    Defined in :numref:`sec_classification`
     """
 
-    def accuracy(self, outputs, Y, *, averaged=True):
-        """
-        Compute the number of correct predictions.
-
-        Defined in :numref:`sec_classification`
-        """
-        outputs = torch.reshape(outputs, (-1, outputs.shape[-1]))
-        preds = torch.argmax(outputs, axis=1)
-        compare = torch.astype(preds == torch.reshape(Y, -1), torch.float32)
-        return torch.reduce_mean(compare) if averaged else compare
-
     def loss(self, outputs, Y, averaged=True):
-        """Defined in :numref:`sec_softmax_concise`"""
         outputs = outputs.reshape(-1, outputs.shape[-1])
         Y = Y.reshape(
             -1,
         )
         return F.cross_entropy(outputs, Y, reduction="mean" if averaged else "none")
 
-    def _pred(output):
-        F.softmax(output, dim=-1)
+    # Used in evaluation/metrics steps, which compare pred(output) and label
+    def pred(self, output):
+        return output.argmax(dim=1).to(torch.int64)
+
+
+class MultiClassifier(Module):
+    """
+    The base class of classification models.
+    """
+
+    def loss(self, outputs, Y, averaged=True):
+        outputs = outputs.reshape(-1, outputs.shape[-1])
+        Y = Y.reshape(
+            -1,
+        )
+        return F.cross_entropy(outputs, Y, reduction="mean" if averaged else "none")
+
+    def pred(self, output):
+        return output.argmax(dim=1)

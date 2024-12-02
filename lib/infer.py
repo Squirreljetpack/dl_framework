@@ -1,4 +1,4 @@
-from .Utils import *
+from .utils import *
 import torcheval.metrics as ms
 
 
@@ -17,7 +17,7 @@ def infer(model, dataloader, batch_fun=lambda x, y: x, y_len=1, device="cpu"):
         model (torch.nn.Module): The model to run inference on.
         dataloader (DataLoader): The DataLoader to provide batches of data for inference.
         batch_fun (function, optional): A function that processes the model's predictions and the true values
-                                        for each batch. Defaults to just returns the model output.
+                                        for each batch and returns a list of computations. Defaults to just returns the model output.
         y_len (int, optional): The number of elements in the target batch. Defaults to 1.
         device (str, optional): The device to compute metrics on, e.g., "cpu" or "cuda".
 
@@ -29,42 +29,25 @@ def infer(model, dataloader, batch_fun=lambda x, y: x, y_len=1, device="cpu"):
 
     model.eval()
     batch_metrics = []
+    batch_num = 0
 
     for _, batch in tqbar(enumerate(dataloader)):
         outputs = model(*batch[:-y_len]).to(device)
-        Y = batch[-y_len:].to(device)
-        computed = batch_fun(outputs, *Y)
-        if len(batch_metrics) == 0:  # instantiate
-            batch_metrics = [[m] for m in computed]
-        else:
-            for i, m in enumerate(computed):
-                batch_metrics[i].append(m)
+        Y = (b.to(device) for b in batch[-y_len:])
+        computed = batch_fun(outputs, *Y, batch_num=batch_num)
+        if isinstance(computed, List):
+            if len(batch_metrics) == 0:  # instantiate
+                batch_metrics = [[m] for m in computed]
+            else:
+                for i, m in enumerate(computed):
+                    batch_metrics[i].append(m)
+        batch_num += 1
 
     model.train(model_training)
 
     return [
         torch.cat(m, dim=0) if isinstance(m, torch.Tensor) else m for m in batch_metrics
     ]
-
-
-def make_batch_fun(torchevals, pred_funs, loss):
-    pred_funs = k_level_list(pred_funs, k=1)
-
-    torchevals = k_level_list(torchevals, k=2)
-    pred_fun += [lambda x: x] * len(torchevals) - len(pred_fun)
-    # preds = ms.Cat()
-
-    def batch_fun(Y, Y_hat):
-        for group, fun in zip(torchevals, pred_funs):
-            ps = k_level_list(fun(Y))
-            for m in group:
-                m.update(*ps, Y_hat)
-        if loss:
-            return [ps, loss(Y, Y_hat)]
-        else:
-            return [ps]
-
-    return batch_fun
 
 
 def eval_classifier(trainer):

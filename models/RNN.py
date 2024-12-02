@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from lib.Utils import *
+from lib.utils import *
 from lib.modules import *
 
 

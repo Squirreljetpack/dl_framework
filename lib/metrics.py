@@ -2,19 +2,9 @@ from abc import abstractmethod
 import polars as pl
 import seaborn as sns
 import matplotlib.pyplot as plt
-from collections import OrderedDict
 import numpy as np
-from .Utils import *
+from .utils import *
 import IPython.display
-
-from enum import Enum
-
-
-# Define the Enum with Train, Val, and Both values
-class TrackModes(Enum):
-    Val = False
-    Train = True
-    Both = 2
 
 
 from torcheval.metrics.metric import Metric
@@ -43,15 +33,13 @@ class MeanMetric(Metric):
         self,
         label,
         statistic: Callable[[object, object], object],
-        compute: Callable[[object, object], object] = lambda total, count: total
+        transform: Callable[[object, object], object] = lambda total, count: total
         / count,
         reduce: Callable[[object, object], object] = lambda total, stat: total + stat,
         device: Optional[torch.device] = None,
-        train: bool = False,
     ):
         self.save_attr()
         self.reset()
-        self.label = "train_" + label if train else label
 
     @torch.inference_mode()
     def compute(self):
@@ -74,38 +62,79 @@ class MeanMetric(Metric):
             self._count += metric._count
 
 
-def from_tem(torcheval_metric, label, pred_funs=lambda x: x, train=False):
-    class _subclass(torcheval_metric):
-        def update(self, *args, **kwargs):
-            super().update(
-                *(f(a) for f, a in zip(self._pred_funs(len(args)), args)), **kwargs
+class CatMetric(Metric):
+    def __init__(
+        self,
+        label,
+        compute=lambda *args: args,
+        update=None,
+        num_outs=None,
+        device=torch.device("cpu"),
+        **kwargs,
+    ):
+        self.label = label
+        self._compute = compute
+        self._kwargs = kwargs
+        self._update = None
+        if callable(update):
+            assert isinstance(num_outs, int)
+            self._update = update
+            self.num_outs = num_outs
+        else:
+            self.num_outs = 2
+        self._device = device
+
+        self.reset()
+
+    @torch.inference_mode()
+    def compute(self):
+        return self._compute(
+            *(a.cpu().numpy() for a in self._store),
+            **self._kwargs,
+        )
+
+    @torch.inference_mode()
+    def update(self, *args):
+        args = tuple(a.to(self._device) for a in args)
+        args = self._update(*args) if callable(self._update) else args
+
+        for idx, tensor in enumerate(self._store):
+            new = args[idx]
+            self._store[idx] = torch.cat(
+                [tensor, new.unsqueeze(0) if new.dim() == 0 else new], dim=0
             )
 
-        def _pred_funs(n):
-            return pred_funs + [lambda x: x] * (n - len(pred_funs))
+    @torch.inference_mode()
+    def reset(self):
+        self._store = [
+            torch.empty(0, dtype=torch.float32, device=self._device)
+            for _ in range(self.num_outs)
+        ]
 
-    c = _subclass()
-    c.label = "train_" + label if train else label
-    c.train = train
+    def to(self, device):
+        self._store = [u.to(device) for u in self._store]
+        self._device = device
+
+    @torch.inference_mode()
+    def merge_state(self: TSelf, metrics: Iterable[TSelf]) -> TSelf:
+        for metric in metrics:
+            for idx, tensor in enumerate(self._store):
+                self._store[idx] = torch.cat([tensor, metric._store[idx]], dim=0)
+
+
+def from_tem(torcheval_metric, label, **kwargs):
+    class _subclass(torcheval_metric):
+        def update(self, *args, **kwargs):
+            super().update(*args, **kwargs)
+
+    c = _subclass(**kwargs)
+    c.label = label
 
     return c
 
 
-def set_trackmodes(*columns, train=TrackModes.Both):
-    if train == TrackModes.Both:
-        new = []
-        for c in columns:
-            d = c.deepcopy()
-            d.train = not c.train
-            new.append(d)
-        columns.extend(new)
-    elif train == TrackModes.Val:
-        for c in columns:
-            c.train = False
-    else:
-        for c in columns:
-            c.train = True
-    return columns
+def _default_pred(*args):
+    return tuple(a.squeeze(-1) for a in args)
 
 
 # For simplicity, only plotted metrics are kept
@@ -113,110 +142,166 @@ class MetricsFrame(Base):
     def __init__(
         self,
         columns: List[Metric],
-        compute_every=1,
-        plot_every=5,
-        index_fn=lambda batch_num, batches_per_epoch: np.float16(
+        flush_every=1,
+        index_fn: Callable = lambda batch_num, batches_per_epoch: np.float32(
             batch_num / batches_per_epoch
         ),
         plot_on_record=False,
         name=None,
-        xlabel="epoch",
-        board=None,
+        xlabel="epoch",  # not related to board
+        train=False,  # used to prefix when plotting
+        out_device=torch.device("cpu"),
+        pred_fun=_default_pred,
     ):
         """_summary_
 
         Args:
             columns (List[Metric]): Instance of torcheval.metrics.metric.Metric with a label property set
-            batch_per_epoch (np.float16): _description_
-            compute_every (int, optional): _description_. Defaults to 1.
-            plot_every (int, optional): _description_. Defaults to 5. Updates between plots. 0 for never.
-            index_fn (_type_, optional): _description_. Defaults to lambdabatch_num.
+            flush_every (int, optional): _description_. Defaults to 1. Flush every n update calls. 0 to never flush.
+            index_fn (Callable, optional): _description_. Defaults to lambda batch_num, batches_per_epoch: np.float32(
+            batch_num / batches_per_epoch
             plot_on_record (bool, optional): _description_. Defaults to False.
-            name (_type_, optional): _description_. Defaults to None.
+            name (str, optional): Metric frame name, used for plot title. Can be computed from columns by default.
+            xlabel (str, optional): Name of column of xlabel, used for plotting. Defaults to "epoch".
+            train
+            out_device
+            pred_fun: defaults to lambda *args: (
+                a.squeeze(-1) for a in args
+            ), as this is the format most torcheval metrics expect
         """
-        self.save_attr()
+        self.save_attr(ignore=["name"])
         self._count = 0
 
-        self.dict = {col.label: [] for col in columns}
-        self.dict[xlabel] = []  # Assuming xlabel is a variable defined elsewhere
+        self._name = name or None
 
-        if self.name is None:
-            self.name = ", ".join([col.label for col in columns])
+        for c in columns:
+            if getattr(c, "label") is None:
+                logging.warning(
+                    f"{c} does not have a label, imputing from c.__class__.__name__"
+                )
+                c.label = c.__class__.__name__
 
-    def flush(self, index):
-        """Computes and resets all columns
+        self.dict = {col.label: [] for col in self.columns}
+        if xlabel is not None:
+            self.dict[xlabel] = []
+
+        self.mfs = None
+        self.df = None
+        self.board = None
+        self._flush_every = flush_every
+
+    def append(self, *columns: Metric):
+        assert all((v == [] for v in self.dict.values())) and self.df is None
+        self.columns.extend(columns)
+        self.dict = {col.label: [] for col in self.columns}
+        if self.xlabel is not None:
+            self.dict[self.xlabel] = []
+
+    def flush(self, index=None):
+        """Computes and resets all columns.
 
         Args:
             index (int): index to associate with row
         """
+        if index is None:
+            assert self.xlabel is None
         for c in self.columns:
-            self.dict[c.label].append(c.compute())
+            val = self.to_out(c.compute())
+            self.dict[c.label].append(val)
+            c.reset()
+        if self.xlabel is not None:
             self.dict[self.xlabel].append(index)
+
+    def reset(self):
+        for c in self.columns:
             c.reset()
 
-    # def _compute(self, train=TrackModes.Both):
-    #     """Computes columns
+    def to(self, device):
+        for m in self.columns:
+            try:
+                m.to(device)
+            except:  # noqa: E722
+                pass
 
-    #     Args:
-    #         index (int): index to associate with row
-    #     """
+    def to_out(self, val):
+        if isinstance(val, torch.Tensor):
+            return val.tolist()  # do we want lists or arrays by default?
+        return val
 
-    #     if train == True:
-    #         (c.compute() for c in filter(lambda x: x.train == train, self.columns))
-    #     elif train == False:
-    #         (c.compute() for c in filter(lambda x: x.train == train, self.columns))
-    #     else:
-    #         (c.compute() for c in self.columns)
+    @property
+    def name(self):
+        return self._name or ", ".join([col.label for col in self.columns]) + (
+            " (training)" if self.train else " (validation)"
+        )
 
-    # todo: compute_batch, probably not worth it
+    def compute(self):
+        """Computes columns
 
-    def update(self, outputs, Y, train=True, batch_num=None, batches_per_epoch=None):
+        Args:
+            index (int): index to associate with row
+        """
+        print(self.dict)
+        return (c.compute() for c in self.columns)
+
+    @torch.inference_mode
+    def update(self, *args, batch_num=None, batches_per_epoch=None):
+        transformed_args = self.pred_fun(*args)
         for c in self.columns:
-            if c.train == train:
-                c.update(outputs, Y)
+            c.update(*transformed_args)
+
         self._count += 1
 
-        index = (
-            self._count
-            if batch_num is None
-            else self.index_fn(batch_num, batches_per_epoch)
-        )  # maybe should not be optional
+        if self._flush_every != 0 and self._count % self._flush_every == 0:
+            index = (
+                self._count
+                if batch_num is None
+                else self.index_fn(batch_num, batches_per_epoch)
+            )  # maybe should not be optional
+            self.flush(index)
 
-        if self.flush_every != 0:
-            div, mod = divmod(self._count, self.flush_every)
-            if mod == 0:
-                self.flush(index)
-                if div % self.plot_every == 0:
-                    self.plot()
+    def _set_flush_unit(self, batch_num):
+        self._flush_every = self.flush_every * batch_num
 
-    def _init_plot(self):
+    def init_plot(self, title=None, **kwargs):
+        """Convenience method to create a board linked to this to draw on"""
+        title = self.name if title is None else title
         if self.board is None:
-            self.board = ProgressBoard(xlabel=self.xlabel)
+            logging.info(f"Creating plot for {self.name}")
+            self.board = ProgressBoard(xlabel=self.xlabel, title=title, **kwargs)
+            self.board.add(self)
+        return self.board
 
     def plot(self, df=False):
-        """Plots"""
-        self._init_plot()
-        if df == True:
-            self.board.draw(self.df, self.name)
+        """Plots our graph on our board"""
+        assert self.xlabel is not None
+        self.init_plot()
+
+        self.board.ax.clear()  # Clear off other graphs such as that may also be associated to our board.
+        if df:  # draw dataframe
+            self.board._draw(self.df, self.xlabel)
         else:
             logging.info(f"Displaying dictionary of {self.name}")
-            self.board.draw(self.dict, self.name)
+            self.board._draw(self.dict, self.xlabel)
 
     def record(self):
         if getattr(self, "df") is None:
             self.df = pl.DataFrame(self.dict)
 
         new_df = pl.DataFrame(self.dict)
-        self.df = self.df.extend(new_df)
-        self.dict.clear()
+        try:
+            self.df = self.df.extend(new_df)
+            self.dict = {k: [] for k, _ in self.dict.items()}
+        except pl.ShapeError:
+            logging.info(
+                "ShapeError encountered. One or more columns may not compute as scalars. Attempting overwrite of self.df."
+            )
+            self.df = new_df
         if self.plot_on_record:
-            self.plot(plot_df=True)
-
-    def reset(self):
-        for c in self.columns:
-            c.reset()
+            self.plot(df=True)
+        return self.df
 
 
+# todo: set title and y_label
 class ProgressBoard(Base):
     def __init__(
         self,
@@ -224,18 +309,23 @@ class ProgressBoard(Base):
         height=600,
         xlim=None,
         ylim=None,
+        title=None,
         xlabel="X",
         ylabel="Y",
         xscale="linear",
         yscale="linear",
         labels=None,
         display=True,
-        update_every=5,
+        draw_every=5,  # draw every n epochs
+        update_df_every=5,  # update df ever n points
         interactive=None,
         save=False,
+        train_prefix="train_",
     ):
-        # Initialize parameters and data structures
         self.save_attr()
+
+        ## Graphical params
+        sns.set_style("whitegrid")
 
         self.fig, self.ax = plt.subplots(
             figsize=(width / 100, height / 100)
@@ -244,10 +334,18 @@ class ProgressBoard(Base):
         if not isinstance(interactive, bool):
             self.interactive = is_notebook()
         if self.interactive:
-            plt.ion()
             self.dh = IPython.display.display(self.fig, display_id=True)
 
-        assert update_every >= 2
+        # Set log scaling based on the provided xscale and yscale
+        if xscale == "log":
+            self.ax.set_xscale("log")
+        if yscale == "log":
+            self.ax.set_yscale("log")
+        if title:
+            self.ax.set_title(title)
+
+        ## Initialize data structures
+        assert draw_every >= 1
 
         if labels:
             self.schema = pl.Schema(
@@ -259,19 +357,19 @@ class ProgressBoard(Base):
                 [(xlabel, pl.Float64), (ylabel, pl.Float64), ("Label", pl.String())]
             )
 
+        self._count = 0
+        self._points_count = 0
+
+        self.mfs = []
+
         self.data = pl.DataFrame(
             schema=self.schema, data=[]
         )  # To store processed data (mean of every n)
 
-        self.raw_points = (
-            OrderedDict()
-        )  # OrderedDict for each label, storing raw points as (n, 2) arrays
+        self._clear_buffer()
 
-        # Set log scaling based on the provided xscale and yscale
-        if xscale == "log":
-            self.ax.set_xscale("log")
-        if yscale == "log":
-            self.ax.set_yscale("log")
+        ## Further config
+        plt.close()
 
         # legend_labels = []
         # for orbit in self.data['Label'].unique():
@@ -279,68 +377,72 @@ class ProgressBoard(Base):
 
         # handles, _ = self.ax.get_legend_handles_labels()
         # self.ax.legend(handles, legend_labels, loc="lower left", bbox_to_anchor=(1.01, 0.29), title="Orbit")
-        # plt.close()
 
-    def draw(self, data):
-        if not self.display:
+    def _redef_ax(self):
+        self.ax.set_ylabel(self.ylabel)
+        self.ax.set_title(self.title)
+
+    def _draw(self, data, xlabel):
+        if isinstance(data, pl.DataFrame):
+            for col in data.columns:
+                if col != xlabel:
+                    sns.lineplot(
+                        x=xlabel, y=data[col], label=col, data=data, ax=self.ax
+                    )
+        elif isinstance(data, Dict):
+            for col in data.keys():
+                if col != xlabel:
+                    sns.lineplot(x=xlabel, y=col, label=col, data=data, ax=self.ax)
+        else:
+            raise TypeError
+        if self.ylim:
+            self.ax.set_ylim(self.ylim)
+
+    def draw_mfs(self, force=False):
+        self._count += 1
+
+        if not force and (not self.display or self._count % self.draw_every) != 0:
             return
         self.ax.clear()
 
-        if isinstance(data, pl.DataFrame):
-            for col in data.columns:
-                if col != self.xabel:
-                    sns.lineplot(x=self.xlabel, y=data[col], label=col, data=data)
-        elif isinstance(data, Dict):
-            sns.lineplot(data=data)
-            plt.xticks(labels=data[self.xlabel])
-        else:
-            raise TypeError
-
+        for mf in self.mfs:
+            if mf.train:
+                self._draw(
+                    {
+                        self.train_prefix + key if key != mf.xlabel else key: value
+                        for key, value in mf.dict.items()
+                    },
+                    mf.xlabel,
+                )
+            else:
+                self._draw(mf.dict, mf.xlabel)
+        self._redef_ax()
         self.iupdate()
 
-    def draw_points(self, x, y, label, every_n=1, force=False, clear=False):
-        """Update plot with new points (arrays) and redraw. todo: Choice of dictionary and df storage as well as batching methods."""
+    def add_mf(self, *mfs: MetricsFrame):
+        for mf in mfs:
+            self.mfs.append(mf)
+            if mf.board is None:
+                mf.board = self
 
-        # Todo: clarify aggregation logic
+    def _clear_buffer(self):
+        self.buffer = {k: [] for k in (self.xlim, self.ylim, "Labels")}
 
-        raw = self.raw_points.setdefault(label, np.empty((0, 2)))
+    def close(self):
+        plt.close()
 
-        new_points = np.column_stack(
-            (x, y)
-        )  # Create a (n, 2) array with x and y columns
-        raw = np.vstack((raw, new_points))
+    # todo: improved aggregation
+    def draw_points(self, x, y, label, every_n=5, force=False, clear=False):
+        """Update plot with new points (arrays) and redraw."""
 
-        if len(raw) < every_n * self.update_every and not force:
-            self.raw_points[label] = raw
-            return
+        self.buffer[self.xlim].append(x)
+        self.buffer[self.ylim].append(x)
+        self.buffer["Labels"].append(label)
 
-        def mean(chunk):
-            # mean = np.mean(chunk, 0)
-            # return mean[0], mean[1]
-            return chunk[-1][0], np.mean(chunk[:, 1], 0)
-
-        # Smooth by taking every_n points
-        new_rows = []
-        end = len(raw) - every_n  # don't smooth the final value(s)
-
-        for i in range(0, end, every_n):
-            chunk = raw[i : i + every_n]
-            x, y = mean(chunk)
-            # Add the new row to the new_rows list
-            new_rows.append((x, y, label))
-
-        raw = raw[end + every_n :]
-        if force:
-            # for row in raw:
-            #     new_rows.append((row[0], row[1], label))
-            if len(raw) > 0:
-                new_rows.append((*mean(chunk), label))
-            raw = np.empty((0, 2))
-
-        self.raw_points[label] = raw
-
-        new_df = pl.DataFrame(new_rows, schema=self.schema, orient="row")
-        self.data = self.data.extend(new_df)
+        if len(self.buffer["Labels"]) >= self.update_df_every or force:
+            new_df = pl.DataFrame(self.buffer)
+            self.data = self.data.extend(new_df)
+            self._clear_buffer()
 
         if not self.display:
             return
@@ -360,7 +462,6 @@ class ProgressBoard(Base):
                 self.ax.clear()
                 sns.scatterplot(x=self.xlabel, y=self.ylabel, hue="Label", data=new_df)
             else:
-                self.ax.clear()
                 sns.scatterplot(
                     x=self.xlabel, y=self.ylabel, hue="Label", data=self.data
                 )
@@ -383,9 +484,23 @@ class ProgressBoard(Base):
     def flush(self):
         for key in self.raw_points.keys():
             self.draw([], [], key, force=True)
+        self.draw_mfs(force=True)
         if self.save:
             plt.savefig("updated_plot.png")
 
     def iupdate(self):
         if self.interactive:
             self.dh.update(self.fig)
+
+def plot_2dheatmap(arr, **kwargs):
+    plt.close("all")
+    sns.heatmap(
+        [[int(el) for el in row] for row in arr],
+        annot=True,
+        fmt=".2f",
+        cmap="Blues",
+    )
+    kwargs.setdefault("xlabel", "Predicted")
+    kwargs.setdefault("ylabel", "Ground truth")
+    plt.gca().set(**kwargs)
+    plt.show()

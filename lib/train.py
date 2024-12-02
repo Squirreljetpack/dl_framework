@@ -1,7 +1,9 @@
 import os
 import glob
+import sys
 import torch
-from .Utils import *
+import torcheval
+from .utils import *
 import torch.nn as nn
 import logging
 import torch.nn.functional as F
@@ -18,8 +20,6 @@ else:
 class Trainer(Base):
     def __init__(
         self,
-        model,
-        data,
         max_epochs=200,
         gpus=None,
         gradient_clip_val=0,
@@ -30,13 +30,18 @@ class Trainer(Base):
         save_loss_threshhold=1,
         logger=None,
         verbosity=0,
-        mfs: List[MetricsFrame] = []
+        train_mfs: List[MetricsFrame] = [],
+        val_mfs: List[MetricsFrame] = [],
+        loss_every=0.2,  # record loss every n epochs
+        flush_mfs=True,
+        flush_epoch_units=True,
+        set_pred=True,  # use model.pred as the predictor function for metric frames
     ):
-        self.save_attr()
+        self.save_attr(ignore=["loaders"])
         if not gpus:
             self.gpus = get_gpus(-1)  # get all gpus by default
         self.tunable = ["lr", "weight_decay"]  # affects saved model name
-        self.board = ProgressBoard(xlabel="epoch")
+        self.board = None  # ProgressBoard(xlabel="epoch")
         self._best_loss = save_loss_threshhold  # save model loss threshold
 
     def prepare_optimizers(self, **kwargs):
@@ -87,62 +92,137 @@ class Trainer(Base):
 
         logging.debug(self.model.named_parameters())
 
+    def prepare_metrics(self, loss_board=None):
+        """Prepare metrics
 
+        Args:
+            loss_board (ProgressBoard | False | None, optional): Defaults to None, creating a progress board. If False, none will be created.
+        """
+        if loss_board is None:
+            loss_board = ProgressBoard(
+                title="Loss", xlabel="epoch", ylabel="loss", yscale="log"
+            )
+        self.train_loss_mf = MetricsFrame(
+            [
+                from_tem(
+                    torcheval.metrics.Mean,
+                    "loss",
+                )
+            ],
+            flush_every=int(self.loss_every * self.num_train_batches),
+            train=True,
+        )
+        self.val_loss_mf = MetricsFrame(
+            [
+                from_tem(
+                    torcheval.metrics.Mean,
+                    "loss",
+                ),
+            ],
+            flush_every=int(self.loss_every * self.num_val_batches),
+        )
 
-    def prepare_metrics(self, mf=[]):
-        # instantiate some default metric frames
-        for mf in self.mfs:
-            if mf.compute_every == -1:
-                mf.compute_every = self.num_train_batches if mf.tra
-        loss_metric_column = 
-        if features in
+        self.val_loss_mf.to(self.device)
+        self.train_loss_mf.to(self.device)
+        if loss_board is not False:
+            loss_board.add_mf(self.train_loss_mf, self.val_loss_mf)
 
-    def init(self, model, data):
-        self.train_dataloader, self.val_dataloader = data.get_dataloaders()
-        self.prepare_model(model)
-        self.prepare_metrics()
+        self.val_mfs = k_level_list(self.val_mfs, k=1)
+        self.train_mfs = k_level_list(self.train_mfs, k=1)
+
+        for mf in self.train_mfs:
+            mf.train = True
+            mf.to(self.device)
+            if self.set_pred:
+                mf.pred_fun = lambda x, *ys: (
+                    self._model.pred(x),
+                    *(a.squeeze(-1) for a in ys),
+                )
+            if self.flush_epoch_units:
+                mf._set_flush_unit(self.num_train_batches)
+
+        for mf in self.val_mfs:
+            mf.train = False
+            mf.to(self.device)
+            if self.set_pred:
+                mf.pred_fun = lambda x, *ys: (
+                    self._model.pred(x),
+                    *(a.squeeze(-1) for a in ys),
+                )
+            if self.flush_epoch_units:
+                mf._set_flush_unit(self.num_val_batches)
 
         # Configure graphical parameters
-        self.board.xlim = self.max_epochs
+
+        # get all the unique boards
+
+        self.boards = ([loss_board] if loss_board else []) + list(
+            set(
+                mf.board for mf in self.train_mfs + self.val_mfs if mf.board is not None
+            )
+        )
+
+    def init(self, model=None, loaders=None):
+        """(Re)initialize model, dataloaders, metric frames.
+
+        Args:
+            model (_type_, optional): _description_. Defaults to None.
+            loaders (_type_, optional): _description_. Defaults to None.
+        """
+        if loaders:
+            self.train_dataloader = loaders[0]
+            self.val_dataloader = loaders[1] if len(loaders) > 1 else None
+        if model:
+            self.prepare_model(model)
+        self.prepare_metrics()
 
     def fit(
         self,
         model,
-        data,
+        loaders,
+        init=True,
     ):
         """Initialize model and data, and begins training
+        Plots metrics every epoch
+        Seperate initialization allows you to configure more, i.e. hook into train_loss_mf
 
         Args:
             model (Module)
-            data (DataModule)
-            torchevals,batch_fun,pred_funs
+            loaders (DataModule)
 
         Returns:
             float: best loss
         """
 
-        self.init(model, data)
+        if init:
+            self.init(model, loaders)
 
-        self.epoch = 0
         self.train_batch_idx = 0
         self.val_batch_idx = 0
 
-        epoch_bar = tqbar(range(self.max_epochs), desc="Epochs progress", unit="Epoch")
-        batch_fun = self._make_batch_fun
+        epoch_bar = tqbar(
+            range(self.first_epoch, self.first_epoch + self.max_epochs),
+            desc="Epochs progress",
+            unit="Epoch",
+        )
 
         for self.epoch in epoch_bar:
-            epoch_loss = self._fit_epoch(batch_fun=batch_fun)
+            epoch_loss = self._fit_epoch()
             epoch_bar.set_description(
                 "Epochs progress [Loss: {:.3e}]".format(epoch_loss)
             )
 
-        self.board.flush()
+        for b in self.boards:
+            b.close()  # Close as many plots as are associated, a bit wonky but works ok
+        if self.flush_mfs:
+            for mf in self.val_mfs + self.train_mfs:
+                try:
+                    mf.flush()
+                except AssertionError:
+                    pass
+        return self._best_loss
 
-        l = self._best_loss
-        self._best_loss = self.save_loss_threshhold
-        return l
-
-    def _fit_epoch(self, train_dataloader=None, val_dataloader=None, y_len=None):
+    def _fit_epoch(self, train_dataloader=None, val_dataloader=None, y_len=1):
         train_dataloader = train_dataloader or self.train_dataloader
         val_dataloader = val_dataloader or self.val_dataloader
 
@@ -152,7 +232,9 @@ class Trainer(Base):
         for batch in train_dataloader:
             outputs = self.model(*batch[:-y_len])
             Y = batch[-y_len:]
-            loss = self.loss(outputs, Y.to(self.device))
+            loss = self.loss(
+                outputs, Y[-1].to(self.device)
+            )  # Sending to the main gpu generalizes to a distributed process
             self.optim.zero_grad()
             with torch.no_grad():
                 loss.backward()
@@ -162,12 +244,26 @@ class Trainer(Base):
                 self.optim.step()
 
                 for m in self.train_mfs:
-                    m.update(outputs, Y, True)
-                self.loss_mf.update(loss)
+                    m.update(
+                        outputs,
+                        *Y,
+                        batch_num=self.train_batch_idx,
+                        batches_per_epoch=self.num_train_batches,
+                    )
+                self.train_loss_mf.update(
+                    loss,
+                    batch_num=self.train_batch_idx,
+                    batches_per_epoch=self.num_train_batches,
+                )
             self.train_batch_idx += 1
 
-            self._debug()
-
+            # debug
+            # if vb(10):
+            #     for param in self.model.named_parameters():
+            #         if param[1].grad is None:
+            #             print("No gradient for parameter:", param)
+            #         elif torch.all(param[1].grad == 0):
+            #             print("Zero gradient for parameter:", param)
 
         if val_dataloader is not None:
             self.model.eval()  # Set the model to evaluation mode, this disables training specific operations such as dropout and batch normalization
@@ -175,14 +271,25 @@ class Trainer(Base):
                 with torch.no_grad():
                     outputs = self.model(*batch[:-y_len])
                     Y = batch[-y_len:]
-                    loss = self.loss(outputs, Y.to(self.device))
+                    loss = self.loss(outputs, Y[-1].to(self.device))
 
-                    for m in self.val_mfs:
-                        m.update(outputs, Y, False)
+                    for mf in self.val_mfs:
+                        mf.update(
+                            outputs,
+                            *Y,
+                            batch_num=self.train_batch_idx,
+                            batches_per_epoch=self.num_train_batches,
+                        )
+                    self.val_loss_mf.update(
+                        loss,
+                        batch_num=self.train_batch_idx,
+                        batches_per_epoch=self.num_train_batches,
+                    )
                 self.val_batch_idx += 1
 
-
         epoch_loss = losses / self.num_train_batches
+        for b in self.boards:
+            b.draw_mfs()
 
         if self.logger:
             self.logger(
@@ -193,6 +300,7 @@ class Trainer(Base):
             self._best_loss = epoch_loss
             if self.save_model:
                 self.__save_model()
+
         return epoch_loss
 
     def clip_gradients(self, grad_clip_val, model):
@@ -239,58 +347,139 @@ class Trainer(Base):
         self.plot("loss", l, train=False)
         return {"val_loss", l}
 
+    # def eval(
+    #     self,
+    #     torchevals=[],
+    #     batch_fun=None,
+    #     pred_funs=None,
+    #     dataloader=None,
+    #     loss=False,
+    # ):
+    #     """
+    #     Evaluates the model on a given dataloader and computes the metrics and/or loss.
+
+    #     Args:
+    #         torchevals (list, optional): List of evaluation metrics or metric groups to be updated during evaluation.
+    #                                     Example: [ms.torcheval.metrics.Cat()] or [[torcheval.metrics.BinaryAccuracy()], [torcheval.metrics.Cat()]]
+    #                                     For a metric in group i, it is updated with m.update(pred_funs[i](outputs),  *Y)
+    #         pred_funs (list, optional): List of prediction functions to be applied to the model outputs.
+    #                                     By default, will apply model.pred to group 1 if defined. If torch_evals is longer, the groups use output directly: i.e. m.update(outputs, *Y)
+    #         batch_fun (function, optional): Custom definition of function that is applied with batch_fun(outputs, *Y) to each batch. If not supplied, will update supplied torchevals using pred_funs, then output [predictions] or [predictions, loss].
+    #         dataloader (DataLoader, optional): The DataLoader to iterate through during evaluation. If None,
+    #                                             defaults to `self.val_dataloader`.
+    #         loss (bool, optional): Whether to output batch_loss in batch_fun. Defaults to False. A custom loss function can also be supplied.
+
+    #     Returns:
+    #         tuple: List of metrics, as many as are output by batch_fun. Tensor type metrics are concatenated, while others are arrays of len(dataloader).
+    #             updated metrics, and the second element is the computed loss if requested.
+    #     """
+    #     assert getattr(self, "_model", None) is not None
+
+    #     if loss is True:
+    #         loss = self.loss
+
+    #     if pred_funs is None:
+    #         pred_funs = [getattr(self._model, "pred", lambda x: x.squeeze(-1))]
+
+    #     if batch_fun is None:
+    #         batch_fun = infer.make_batch_fun(torchevals, pred_funs, loss)
+
+    #     return infer.infer(
+    #         self.model,
+    #         dataloader or self.val_dataloader,
+    #         batch_fun,
+    #         device=self.device,
+    #     )
+
     def eval(
         self,
-        torchevals=[],
+        mfs: Union[MetricsFrame, List[MetricsFrame]] = [],
+        pred: Union[Callable, bool] = False,
+        loss: Union[Callable, bool] = False,
+        dataloader: torch.utils.data.DataLoader = None,
         batch_fun=None,
-        pred_funs=None,
-        dataloader=None,
-        loss=False,
     ):
-        """
-        Evaluates the model on a given dataloader and computes the metrics and/or loss.
+        """Evaluates the model on a given dataloader and updates the given MetricFrames on the output. Also computes loss/pred if specified.
 
         Args:
-            torchevals (list, optional): List of evaluation metrics or metric groups to be updated during evaluation.
-                                        Example: [ms.torcheval.metrics.Cat()] or [[torcheval.metrics.BinaryAccuracy()], [torcheval.metrics.Cat()]]
-                                        For a metric in group i, it is updated with m.update(pred_funs[i](outputs),  *Y)
-            pred_funs (list, optional): List of prediction functions to be applied to the model outputs.
-                                        By default, will apply model.pred to group 1 if defined. If torch_evals is longer, the groups use output directly: i.e. m.update(outputs, *Y)
-            batch_fun (function, optional): Custom definition of function that is applied with batch_fun(outputs, *Y) to each batch. If not supplied, will update supplied torchevals using pred_funs, then output [predictions] or [predictions, loss].
+            mfs (Union[MetricsFrame, List[MetricsFrame]], optional): _description_. Defaults to [].
+            pred (Union[Callable, bool], optional): Whether to track model predictions. Defaults to False. A custom pred function can also be supplied.
+            loss (Union[Callable, bool], optional): Whether to track loss. Defaults to False. A custom loss function can also be supplied. Defaults to False.
             dataloader (DataLoader, optional): The DataLoader to iterate through during evaluation. If None,
-                                                defaults to `self.val_dataloader`.
-            loss (bool, optional): Whether to output batch_loss in batch_fun. Defaults to False. A custom loss function can also be supplied.
+                defaults to `self.val_dataloader`.
+            batch_fun (Callable, optional): _description_. Defaults to None.
 
         Returns:
-            tuple: List of metrics, as many as are output by batch_fun. Tensor type metrics are concatenated, while others are arrays of len(dataloader).
-                updated metrics, and the second element is the computed loss if requested.
+            A MetricFrame with loss and/or pred columns. None if loss and pred are both unspecified.
         """
-        if getattr(self, "_model", None) is None:
-            self.init()
+        assert getattr(self, "_model", None) is not None
+        mfs = k_level_list(mfs, k=1)
 
-            if loss is True:
-                loss = self.loss
+        output_cols = []
+        pred_fn = pred if callable(pred) else self._model.pred
 
-            if pred_funs is None:
-                pred_funs = [getattr(self._model, "_pred", lambda x: x)]
+        if pred is not False:
+            output_cols.append(
+                CatMetric(
+                    "preds",
+                    update=lambda x, *ys: (pred_fn(x),),
+                    num_outs=1,
+                    device=self.device,
+                )
+            )
 
-            if batch_fun is None:
-                batch_fun = infer.make_batch_fun(torchevals, pred_funs, loss)
+        if loss is not False:
+            loss_fn = loss if callable(loss) else self.loss
+            output_cols.append(
+                CatMetric(
+                    "loss",
+                    update=lambda x, *ys: (loss_fn(x, *ys),),
+                    num_outs=1,
+                    device=self.device,
+                )
+            )
 
-        return infer.infer(
+        for mf in mfs:
+            mf._set_flush_unit(1)
+            mf.to(self.device)
+            if self.set_pred:
+                mf.pred_fun = lambda x, *ys: (
+                    self._model.pred(x),
+                    *(a.squeeze(-1) for a in ys),
+                )
+
+        output_mf = None
+
+        if loss is not False or pred is not False:
+            output_mf = MetricsFrame(
+                output_cols, flush_every=1, xlabel="batch_num", index_fn=lambda x, y: x
+            )
+            mfs.append(output_mf)
+
+        # for mf in mfs:
+        #     mf.index_fn = lambda *args: self._eval_batch_num
+        #     mf.xlabel = mf.xlabel if mf.xlabel is None else "batch_num"
+
+        if batch_fun is None:
+
+            def batch_fun(*args, batch_num):
+                for mf in mfs:
+                    mf.update(*args, batch_num=batch_num)
+
+        dataloader = dataloader or self.val_dataloader
+
+        infer.infer(
             self.model,
-            dataloader or self.val_dataloader,
+            dataloader,
             batch_fun,
             device=self.device,
         )
 
-    def _debuf(self):
-        if self.verbosity > 5:
-            for param in self.model.named_parameters():
-                if param[1].grad is None:
-                    print("No gradient for parameter:", param)
-                elif torch.all(param[1].grad == 0):
-                    print("Zero gradient for parameter:", param)
+        for mf in mfs:
+            mf.flush(mf._count)
+
+        if output_mf is not None:
+            return mfs.pop()
 
     @property
     def filename(self):
