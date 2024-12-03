@@ -1,4 +1,5 @@
 from abc import abstractmethod
+import logging
 import polars as pl
 import seaborn as sns
 import matplotlib.pyplot as plt
@@ -26,6 +27,8 @@ TComputeReturn = TypeVar("TComputeReturn")
 # pyre-ignore[33]: Flexible key data type for dictionary
 TState = Union[torch.Tensor, List[torch.Tensor], Dict[Any, torch.Tensor], int, float]
 
+def make_loss_board():
+    return ProgressBoard(title="Loss", xlabel="epoch", ylabel="loss", yscale="log")
 
 # operator.add, operator.truediv?
 class MeanMetric(Metric):
@@ -122,7 +125,7 @@ class CatMetric(Metric):
                 self._store[idx] = torch.cat([tensor, metric._store[idx]], dim=0)
 
 
-def from_tem(torcheval_metric, label, **kwargs):
+def from_te(torcheval_metric, label, **kwargs):
     class _subclass(torcheval_metric):
         def update(self, *args, **kwargs):
             super().update(*args, **kwargs)
@@ -146,12 +149,14 @@ class MetricsFrame(Base):
         index_fn: Callable = lambda batch_num, batches_per_epoch: np.float32(
             batch_num / batches_per_epoch
         ),
-        plot_on_record=False,
         name=None,
         xlabel="epoch",  # not related to board
         train=False,  # used to prefix when plotting
         out_device=torch.device("cpu"),
         pred_fun=_default_pred,
+        logger=False,
+        plot_on_record=False,
+        logging_prefix="",
     ):
         """_summary_
 
@@ -168,6 +173,7 @@ class MetricsFrame(Base):
             pred_fun: defaults to lambda *args: (
                 a.squeeze(-1) for a in args
             ), as this is the format most torcheval metrics expect
+            logger (Callable | None | False, optional): Will log with self.logger when flush if configured. Set this to None to have Trainer configure this.
         """
         self.save_attr(ignore=["name"])
         self._count = 0
@@ -185,7 +191,6 @@ class MetricsFrame(Base):
         if xlabel is not None:
             self.dict[xlabel] = []
 
-        self.mfs = None
         self.df = None
         self.board = None
         self._flush_every = flush_every
@@ -197,24 +202,57 @@ class MetricsFrame(Base):
         if self.xlabel is not None:
             self.dict[self.xlabel] = []
 
-    def flush(self, index=None):
+    def rename(self, from_label: str, to_label: str):
+        assert all((v == [] for v in self.dict.values())) and self.df is None
+        for c in self.columns:
+            if c.label == from_label:
+                c.label = to_label
+                self.dict[to_label] = self.dict.pop(from_label)
+                break
+
+    def flush(self, index=None, log_metric=True):
         """Computes and resets all columns.
+        If self.logger is configured, will also log computed values (requires xlabel to be set).
 
         Args:
             index (int): index to associate with row
         """
+        should_log = log_metric and callable(self.logger)
+        log_dict = {}
         if index is None:
             assert self.xlabel is None
         for c in self.columns:
             val = self.to_out(c.compute())
             self.dict[c.label].append(val)
+            if should_log:
+                log_dict[self.logging_prefix + c.label] = val
             c.reset()
         if self.xlabel is not None:
             self.dict[self.xlabel].append(index)
+            if should_log:
+                log_dict[self.xlabel] = index
+                self.logger(log_dict)
+
+    def compute(self):
+        """Computes columns
+
+        Args:
+            index (int): index to associate with row
+        """
+        return {c.label: c.compute() for c in self.columns}
 
     def reset(self):
         for c in self.columns:
             c.reset()
+
+    def clear(self):
+        for c in self.columns:
+            c.reset()
+        self.dict = {col.label: [] for col in self.columns}
+        if self.xlabel is not None:
+            self.dict[self.xlabel] = []
+
+        self.df = None
 
     def to(self, device):
         for m in self.columns:
@@ -234,20 +272,11 @@ class MetricsFrame(Base):
             " (training)" if self.train else " (validation)"
         )
 
-    def compute(self):
-        """Computes columns
-
-        Args:
-            index (int): index to associate with row
-        """
-        print(self.dict)
-        return (c.compute() for c in self.columns)
-
     @torch.inference_mode
     def update(self, *args, batch_num=None, batches_per_epoch=None):
-        transformed_args = self.pred_fun(*args)
+        args = self.pred_fun(*args)
         for c in self.columns:
-            c.update(*transformed_args)
+            c.update(*args)
 
         self._count += 1
 
@@ -320,7 +349,7 @@ class ProgressBoard(Base):
         update_df_every=5,  # update df ever n points
         interactive=None,
         save=False,
-        train_prefix="train_",
+        train_prefix="train/",
     ):
         self.save_attr()
 
@@ -381,6 +410,7 @@ class ProgressBoard(Base):
     def _redef_ax(self):
         self.ax.set_ylabel(self.ylabel)
         self.ax.set_title(self.title)
+        self.ax.set_yscale(self.yscale)
 
     def _draw(self, data, xlabel):
         if isinstance(data, pl.DataFrame):
@@ -391,12 +421,11 @@ class ProgressBoard(Base):
                     )
         elif isinstance(data, Dict):
             for col in data.keys():
-                if col != xlabel:
+                if col != xlabel and data[col]:
                     sns.lineplot(x=xlabel, y=col, label=col, data=data, ax=self.ax)
         else:
             raise TypeError
-        if self.ylim:
-            self.ax.set_ylim(self.ylim)
+        self._redef_ax()
 
     def draw_mfs(self, force=False):
         self._count += 1

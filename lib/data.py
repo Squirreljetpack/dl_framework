@@ -1,7 +1,6 @@
 from collections import Counter
 import random
 import re
-from sklearn.model_selection import KFold, ShuffleSplit, TimeSeriesSplit
 import torch
 from lib import dfs
 from lib.datasets.datasets import SubDataset
@@ -16,16 +15,42 @@ from sklearn.preprocessing import LabelEncoder
 
 import glob
 
+#
+@dataclass(kw_only=True)
+class DataConfig(Config):
+    data: Optional[Any] = None
+    dataset: Optional[Any] = None
+    batch_size: int = 32
+    num_workers: int = field(default_factory=os.cpu_count)
+    sampler: Optional[Any] = None
+    transform: Any = None
 
-class DataModule(Base):
+# used in wandb
+@dataclass(kw_only=True)
+class DataloaderConfig(Config):
+    batch_size: int = None
+    num_workers: int = None
+    sampler: Optional[Any] = None
+    shuffle: bool = None
+    sampler: Optional[Any] = None
+    batch_sampler: Optional[Any] = None
+    collate_fn: Optional[Any] = None
+    pin_memory: bool = None
+    drop_last: bool = None
+    timeout: int = None
+    worker_init_fn: Optional[Any] = None
+    multiprocessing_context: Optional[Any] = None
+    generator: Optional[Any] = None
+    prefetch_factor: Optional[int] = None
+    persistent_workers: bool = None
+    pin_memory_device: Optional[str] = None
+
+
+class Data(Base):
     """The base class of td."""
 
-    # copy this signature when inheriting
-    def __init__(
-        self, data=None, dataset=None, batch_size=32, num_workers=1, sampler=None
-    ):
+    def __init__(self):
         super().__init__()
-        self.save_attr()
 
         # For folds
         self._data_inds = None
@@ -33,6 +58,7 @@ class DataModule(Base):
         self._folder = None
 
         # Subclasses define self.data = (X, y), or dataset/(train_set, val_set) directly
+        # Be sure to include set_folds
 
     def _to_dataset(self, data):
         """Converts tensor tuples to dataset"""
@@ -182,10 +208,13 @@ class DataModule(Base):
         """
 
         self._folder = split_method
-        if self.dataset is not None:
-            self._folds = self._folder.split(np.arange(len(self.dataset)))
-        if self.data is not None:
-            self._folds = self._folder.split(*self.data)
+        try:
+            if self.dataset is not None:
+                self._folds = self._folder.split(np.arange(len(self.dataset)))
+            if self.data is not None:
+                self._folds = self._folder.split(*self.data)
+        except AttributeError:
+            raise AttributeError("dataset/data not found. Have you called set_data?")
 
     @property
     def raw_len(self):
@@ -198,11 +227,11 @@ class DataModule(Base):
                 raise AttributeError
 
     # todo: shuffle when train_set is given
-    def folds(self):
+    def folds(self, continue_existing=True):
         """Provides an iterator that changes self.data_inds, used by self.loaders(), using iterator provided by self._folds, to be used to loop over folds.
 
         >>> from sklearn.model_selection import KFold
-        >>> t = DataModule()
+        >>> t = Data()
         >>> t.data = ([1, 2, 3], [1, 2, 3])
         >>> t.set_folds(KFold(n_splits=3))
         >>> for i in t.folds(): print(t.data_inds)
@@ -210,9 +239,14 @@ class DataModule(Base):
         (array([0, 2]), array([1]))
         (array([0, 1]), array([2]))
         """
-        if not self._folds and self.data is not None:
-            logging.debug(f"Reinitializing folds on data of length {len(self.raw_len)}")
-            self._folds = self._folder.split(np.arange(self.raw_len))
+
+        def initialize():
+            assert self._folder is not None and self.data is not None
+            self.set_folds(self._folder)
+
+        if not self._folds or not continue_existing:
+            initialize()
+
         fold_num = 0
         while True:
             try:
@@ -220,6 +254,8 @@ class DataModule(Base):
                 fold_num += 1
                 yield fold_num
             except StopIteration:
+                initialize()
+                # logging.debug("Reinitializing folds")
                 return
 
     ## Data Preview section
@@ -297,7 +333,7 @@ class DataModule(Base):
         )
 
 
-class DataModuleFromLoader(DataModule):
+class DataFromLoader(Data):
     def __init__(self, train_loader, val_loader, batch_size=32, num_workers=1):
         super().__init__()
         self.save_attr()
@@ -308,7 +344,7 @@ class DataModuleFromLoader(DataModule):
         return self.train_loader, self.val_loader
 
 
-class ClassifierModule(DataModule):
+class ClassifierModule(Data):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.save_attr()
@@ -350,8 +386,6 @@ class ClassifierModule(DataModule):
             torch.tensor(self.le.fit_transform(labels), dtype=torch.int64),
         )
 
-        self.counts = Counter(labels)
-
         if test:
             self.test_data = data
             self.test_dataset = None
@@ -359,14 +393,20 @@ class ClassifierModule(DataModule):
             self.data = data
             self.dataset = None
 
+        # counts
+
+        self.counts = sorted(
+            list(Counter(labels).items()), key=lambda x: self.encode_label(x[0])
+        )
+
         if show_counts and test is False:
             self.show_counts(test=test)
 
     def show_counts(self, test=False):
         assert all((self.counts, self.data, self.le))
-        print("data[-1] counts")
-        for k, v in self.counts.items():
-            print(f"{k} ({self.encode_label(k)}): {v}")
+        print("data[-1] counts in label order from 0")
+        for k, v in self.counts:
+            print(f"{k}: {v}")
 
     @classmethod
     def make_inverse_sampler(cls, factor=1):
@@ -380,12 +420,11 @@ class ClassifierModule(DataModule):
             nonlocal factor
             assert all((self.data, self.counts))
 
-            def nth_label(n):
-                x = self.data[-1][inds[n]]
-                return self.decode_label(x)
+            def idx_to_label(n):
+                return self.data[-1][inds[n]]
 
             weights = [
-                pow(self.counts[nth_label(i)], -factor) for i in range(len(inds))
+                pow(self.counts[idx_to_label(i)][1], -factor) for i in range(len(inds))
             ]
 
             return td.WeightedRandomSampler(
@@ -397,7 +436,7 @@ class ClassifierModule(DataModule):
         return inner
 
 
-class ImageDataModule(ClassifierModule):
+class ImageData(ClassifierModule):
     # Use set_data
     def _paths_and_labels_from_folder(
         self,

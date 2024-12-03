@@ -29,7 +29,7 @@ class Module(nn.Module, Base):
         return f"{self.__class__.__name__}_{param_str}"
 
     def pred(self, output):
-        return output
+        return output.squeeze(-1)
 
     def layer_summary(self, X_shape):
         """Displays model output dimensions for each layer given input X-shape.
@@ -41,6 +41,15 @@ class Module(nn.Module, Base):
         for layer in self.net:
             X = layer(X)
             print(layer.__class__.__name__, "output shape:\t", X.shape)
+
+
+# Just a reminder of basic field names, better to declare all fields when subclassing and subclass Config instead
+@dataclass(kw_only=True)
+class ClassifierConfig(Config):
+    n_blks: int  # num primary blocks
+    n_classes: int
+    dropout: float = 0.1
+    hidden_size: int  # first MLP
 
 
 class Classifier(Module):
@@ -57,7 +66,7 @@ class Classifier(Module):
 
     # Used in evaluation/metrics steps, which compare pred(output) and label
     def pred(self, output):
-        return output.argmax(dim=1).to(torch.int64)
+        return output.argmax(dim=-1).to(torch.int64)
 
 
 class MultiClassifier(Module):

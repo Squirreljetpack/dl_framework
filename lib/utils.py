@@ -1,15 +1,16 @@
 import inspect
 from contextlib import contextmanager
 import os
-from typing import Dict, List
 import numpy as np
 import pandas as pd
 import torch
 import polars as pl
 import math
-
+from collections.abc import Mapping, Iterable
+from dataclasses import is_dataclass, fields
 from functools import reduce
-
+from dataclasses import dataclass, field, asdict
+from typing import Any, Dict, List, Optional, Union
 
 def is_notebook():
     # credit -> https://stackoverflow.com/a/39662359
@@ -41,7 +42,57 @@ def apply_kwargs(func, kwargs):
     valid_kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
     return func(**valid_kwargs)
 
+@dataclass
+class Config:
+    @classmethod
+    def _filter_kwargs(cls, *dicts, **kwargs):
+        def arg_to_dict(d):
+            if isinstance(d, type):  # Check if d is a class
+                return vars(d)
+            #  Returns False for some reason
+            # if isinstance(d, Config):
+            #     d = d.__dict__
+            if isinstance(d, Dict):
+                return d
+            else:
+                return d.__dict__
 
+        all_dicts = tuple(arg_to_dict(d) for d in dicts) + (kwargs,)
+
+        merged_dict = {
+            key: value
+            for d in all_dicts
+            for key, value in d.items()
+            if key in cls.__dataclass_fields__
+        }
+
+        return merged_dict
+
+    def update(self, *dicts, **kwargs):
+        """Use one or more positional Dict/Config/Class's and/or kwargs to update only existing attributes"""
+        for key, value in self._filter_kwargs(*dicts, **kwargs).items():
+            setattr(self, key, value)
+        return self
+
+    @classmethod
+    def create(cls, *dicts, **kwargs):
+        """Use one or more positional Dict/Config/Class's and/or kwargs to fill in the fields of and create a Config."""
+        return cls(**cls._filter_kwargs(*dicts, **kwargs))
+
+    @classmethod
+    def dict_from(cls, *dicts, **kwargs):
+        """create but outputs a Dict"""
+        return asdict(cls.create(*dicts, **kwargs))
+
+    # def show(self, indent=4):
+    #     """
+    #     Pretty prints a (possibly deeply-nested) dataclass.
+    #     Each new block will be indented by `indent` spaces (default is 4).
+    #     """
+    #     print(stringify(self, indent))
+
+    def dict(self, include_none=False):
+        return {k: v for k, v in asdict(self).items() if include_none or v is not None}
 class Base:
     def save_parameters(self, ignore=[]):
         """Save function arguments into self.p"""
@@ -75,6 +126,12 @@ class Base:
         for k, v in self.p.items():
             if clobber or getattr(self, k, None) is None:
                 setattr(self, k, v)
+
+    def save_config(self, config: Config, ignore=[], clobber=True):
+        for k, v in config.__dict__.items():
+            if k not in ignore:
+                if clobber or getattr(self, k, None) is None:
+                    setattr(self, k, v)
 
     @property
     def device(self):
@@ -281,3 +338,63 @@ def factorize(n):
         d, r = divmod(n, i)
         if r == 0:
             return (d, i)
+
+
+def stringify(obj, indent=4, _indents=0):
+    if isinstance(obj, str):
+        return f"'{obj}'"
+
+    if not is_dataclass(obj) and not isinstance(obj, (Mapping, Iterable)):
+        return str(obj)
+
+    this_indent = indent * _indents * " "
+    next_indent = indent * (_indents + 1) * " "
+    start, end = (
+        f"{type(obj).__name__}(",
+        ")",
+    )  # dicts, lists, and tuples will re-assign this
+
+    if is_dataclass(obj):
+        body = "\n".join(
+            f"{next_indent}{field.name}="
+            f"{stringify(getattr(obj, field.name), indent, _indents + 1)},"
+            for field in fields(obj)
+        )
+
+    elif isinstance(obj, Mapping):
+        if isinstance(obj, dict):
+            start, end = "{}"
+
+        body = "\n".join(
+            f"{next_indent}{stringify(key, indent, _indents + 1)}: "
+            f"{stringify(value, indent, _indents + 1)},"
+            for key, value in obj.items()
+        )
+
+    else:  # is Iterable
+        if isinstance(obj, list):
+            start, end = "[]"
+        elif isinstance(obj, tuple):
+            start = "("
+
+        body = "\n".join(
+            f"{next_indent}{stringify(item, indent, _indents + 1)}," for item in obj
+        )
+
+    return f"{start}\n{body}\n{this_indent}{end}"
+
+
+def get_project_name():
+    import subprocess
+
+    repo_name = (
+        subprocess.check_output(["git", "rev-parse", "--show-toplevel"])
+        .decode("utf-8")
+        .strip()
+    )
+    repo_name = os.path.basename(repo_name)
+
+    caller_frame = inspect.stack()[1]
+    caller_file = caller_frame.filename
+    filename = os.path.splitext(os.path.basename(caller_file))[0]
+    return f"{repo_name}_{filename}"

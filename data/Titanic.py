@@ -12,9 +12,9 @@ from sklearn.model_selection import KFold
 
 
 class Titanic(ClassifierModule):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.save_attr()
+    def __init__(self, c: DataConfig):
+        super().__init__()
+        self.save_config(c)
 
         # Preprocessing
         df = pl.read_csv(

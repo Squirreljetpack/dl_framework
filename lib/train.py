@@ -1,5 +1,6 @@
 import os
 import glob
+from pathlib import Path
 import sys
 import torch
 import torcheval
@@ -10,39 +11,42 @@ import torch.nn.functional as F
 from . import infer
 import torcheval.metrics as ms
 from .metrics import *
+from .config import *
 
 if is_notebook():
     from tqdm.notebook import tqdm as tqbar
 else:
     from tqdm import tqdm as tqbar
 
+@dataclass(kw_only=True)
+class TrainerConfig(Config):
+    max_epochs: int = 200
+    gpus: Optional[List[int]] = None  # Optional list of GPUs to use
+    gradient_clip_val: float = 0.0
+    lr: float = 0.1
+    weight_decay: float = 0.01
+    save_model: bool = False
+    load_previous: bool = False
+    save_loss_threshold: float = 1.0
+    logger: Optional[Any] = None
+    verbosity: int = 0
+    train_mfs: MetricsFrame | List[MetricsFrame] = field(default_factory=list)
+    val_mfs: MetricsFrame | List[MetricsFrame] = field(default_factory=list)
+    loss_every: float = 0.2  # record loss every n epochs
+    flush_mfs: bool = True
+    flush_epoch_units: bool = True
+    set_pred: bool = True  # use model.pred as the predictor function for metric frames
+    save_path: str | Path = "./out"
+
 
 class Trainer(Base):
-    def __init__(
-        self,
-        max_epochs=200,
-        gpus=None,
-        gradient_clip_val=0,
-        lr=0.1,
-        weight_decay=0.01,
-        save_model=False,
-        load_previous=False,
-        save_loss_threshhold=1,
-        logger=None,
-        verbosity=0,
-        train_mfs: List[MetricsFrame] = [],
-        val_mfs: List[MetricsFrame] = [],
-        loss_every=0.2,  # record loss every n epochs
-        flush_mfs=True,
-        flush_epoch_units=True,
-        set_pred=True,  # use model.pred as the predictor function for metric frames
-    ):
-        self.save_attr(ignore=["loaders"])
-        if not gpus:
+    def __init__(self, c: TrainerConfig):
+        self.save_config(c, ignore=["loaders"])
+        if not c.gpus:
             self.gpus = get_gpus(-1)  # get all gpus by default
         self.tunable = ["lr", "weight_decay"]  # affects saved model name
         self.board = None  # ProgressBoard(xlabel="epoch")
-        self._best_loss = save_loss_threshhold  # save model loss threshold
+        self._best_loss = 9999  # save model loss threshold
 
     def prepare_optimizers(self, **kwargs):
         self.optim = torch.optim.AdamW(
@@ -99,27 +103,25 @@ class Trainer(Base):
             loss_board (ProgressBoard | False | None, optional): Defaults to None, creating a progress board. If False, none will be created.
         """
         if loss_board is None:
-            loss_board = ProgressBoard(
-                title="Loss", xlabel="epoch", ylabel="loss", yscale="log"
-            )
+            loss_board = make_loss_board()
         self.train_loss_mf = MetricsFrame(
             [
-                from_tem(
+                from_te(
                     torcheval.metrics.Mean,
                     "loss",
                 )
             ],
-            flush_every=int(self.loss_every * self.num_train_batches),
+            flush_every=max(1, int(self.loss_every * self.num_train_batches)),
             train=True,
         )
         self.val_loss_mf = MetricsFrame(
             [
-                from_tem(
+                from_te(
                     torcheval.metrics.Mean,
                     "loss",
                 ),
             ],
-            flush_every=int(self.loss_every * self.num_val_batches),
+            flush_every=max(1, int(self.loss_every * self.num_train_batches)),
         )
 
         self.val_loss_mf.to(self.device)
@@ -141,6 +143,10 @@ class Trainer(Base):
             if self.flush_epoch_units:
                 mf._set_flush_unit(self.num_train_batches)
 
+            if self.logger:
+                if mf.logger is None:
+                    mf.logger = self.logger
+
         for mf in self.val_mfs:
             mf.train = False
             mf.to(self.device)
@@ -152,6 +158,10 @@ class Trainer(Base):
             if self.flush_epoch_units:
                 mf._set_flush_unit(self.num_val_batches)
 
+            if self.logger:
+                if mf.logger is None:
+                    mf.logger = self.logger
+
         # Configure graphical parameters
 
         # get all the unique boards
@@ -162,8 +172,10 @@ class Trainer(Base):
             )
         )
 
-    def init(self, model=None, loaders=None):
-        """(Re)initialize model, dataloaders, metric frames.
+    def init(self, model=None, loaders=None, loss_board=None):
+        """(Re)initialize model, dataloaders, metric frames. Will error if any are not already initialized.
+        Useful if you want to further customize initialized objects such as trainer.val_loss_mf before calling trainer.fit(init=False).
+        Set loss_board to False to disable loss plotting.
 
         Args:
             model (_type_, optional): _description_. Defaults to None.
@@ -174,27 +186,27 @@ class Trainer(Base):
             self.val_dataloader = loaders[1] if len(loaders) > 1 else None
         if model:
             self.prepare_model(model)
-        self.prepare_metrics()
+        self.prepare_metrics(loss_board=loss_board)
 
     def fit(
         self,
-        model,
-        loaders,
-        init=True,
+        model=None,
+        loaders=None,
     ):
-        """Initialize model and data, and begins training
-        Plots metrics every epoch
-        Seperate initialization allows you to configure more, i.e. hook into train_loss_mf
+        """Calls trainer.init(model, data), and begins training.
+        Plots metrics every epoch.
+        Skips initialization if neither are supplied.
 
         Args:
             model (Module)
-            loaders (DataModule)
+            loaders (Data)
 
         Returns:
             float: best loss
         """
 
-        if init:
+        if model is not None or loaders is not None:
+            assert model is not None and loaders is not None
             self.init(model, loaders)
 
         self.train_batch_idx = 0
@@ -228,7 +240,6 @@ class Trainer(Base):
 
         self.model.train()
         losses = 0
-        vals = []
         for batch in train_dataloader:
             outputs = self.model(*batch[:-y_len])
             Y = batch[-y_len:]
@@ -238,7 +249,8 @@ class Trainer(Base):
             self.optim.zero_grad()
             with torch.no_grad():
                 loss.backward()
-                losses += loss
+                if val_dataloader is None:
+                    losses += loss
                 if self.gradient_clip_val > 0:
                     self.clip_gradients(self.gradient_clip_val, self.model)
                 self.optim.step()
@@ -250,11 +262,12 @@ class Trainer(Base):
                         batch_num=self.train_batch_idx,
                         batches_per_epoch=self.num_train_batches,
                     )
-                self.train_loss_mf.update(
-                    loss,
-                    batch_num=self.train_batch_idx,
-                    batches_per_epoch=self.num_train_batches,
-                )
+                if self.train_loss_mf:
+                    self.train_loss_mf.update(
+                        loss,
+                        batch_num=self.train_batch_idx,
+                        batches_per_epoch=self.num_train_batches,
+                    )
             self.train_batch_idx += 1
 
             # debug
@@ -272,7 +285,7 @@ class Trainer(Base):
                     outputs = self.model(*batch[:-y_len])
                     Y = batch[-y_len:]
                     loss = self.loss(outputs, Y[-1].to(self.device))
-
+                    losses += loss
                     for mf in self.val_mfs:
                         mf.update(
                             outputs,
@@ -280,25 +293,21 @@ class Trainer(Base):
                             batch_num=self.train_batch_idx,
                             batches_per_epoch=self.num_train_batches,
                         )
-                    self.val_loss_mf.update(
-                        loss,
-                        batch_num=self.train_batch_idx,
-                        batches_per_epoch=self.num_train_batches,
-                    )
+                    if self.val_loss_mf:
+                        self.val_loss_mf.update(
+                            loss,
+                            batch_num=self.train_batch_idx,
+                            batches_per_epoch=self.num_train_batches,
+                        )
                 self.val_batch_idx += 1
 
         epoch_loss = losses / self.num_train_batches
         for b in self.boards:
             b.draw_mfs()
 
-        if self.logger:
-            self.logger(
-                {"epoch": self.epoch, "loss": epoch_loss, **mean_of_dicts(vals)}
-            )
-
         if epoch_loss <= self._best_loss:
             self._best_loss = epoch_loss
-            if self.save_model:
+            if self.save_model and epoch_loss <= self.save_loss_threshold:
                 self.__save_model()
 
         return epoch_loss
@@ -329,7 +338,7 @@ class Trainer(Base):
         else:
             y = y.detach()
 
-        label = f"{'train_' if train else ''}{label}"
+        label = f"{'train/' if train else ''}{label}"
         self.board.draw_points(x, y, label, every_n=n)
 
     def training_step(self, batch):
@@ -445,8 +454,9 @@ class Trainer(Base):
             if self.set_pred:
                 mf.pred_fun = lambda x, *ys: (
                     self._model.pred(x),
-                    *(a.squeeze(-1) for a in ys),
-                )
+                    *(a.squeeze(tuple(range(1, len(a.shape)))) for a in ys),
+                )  # don't squeeze batch index
+                # also tried squeeze(-1) but this may be better
 
         output_mf = None
 
@@ -479,7 +489,7 @@ class Trainer(Base):
             mf.flush(mf._count)
 
         if output_mf is not None:
-            return mfs.pop()
+            return mfs.pop().dict
 
     @property
     def filename(self):
@@ -526,30 +536,67 @@ class Trainer(Base):
                 return checkpoint["params"]
             return None
 
+    # sweep_configuration = {
+    #     "method": "random",
+    #     "name": "sweep",
+    #     "metric": {"goal": "minimize", "name": "loss"},
+    #     "parameters": {
+    #         "batch_size": {"values": [16, 32, 64]},
+    #         "max_epochs": {"values": [5, 10, 15]},
+    #         "lr": {"max": 0.1, "min": 0.0001},
+    #     },
+    # }
 
-sweep_configuration = {
-    "method": "random",
-    "name": "sweep",
-    "metric": {"goal": "minimize", "name": "loss"},
-    "parameters": {
-        "batch_size": {"values": [16, 32, 64]},
-        "max_epochs": {"values": [5, 10, 15]},
-        "lr": {"max": 0.1, "min": 0.0001},
-    },
-}
+
+# # Create the sweep in WandB
+# sweep_id = wandb.sweep(sweep_configuration, project="my_project")
+
+# # Define different datasets (Replace these with actual datasets or dataset paths)
+# datasets = [
+#     "dataset_1",
+#     "dataset_2",
+#     "dataset_3",
+#     "dataset_4",
+#     "dataset_5",
+#     "dataset_6",
+# ]
 
 
-def tune(model, data, sweep_configuration=sweep_configuration):
-    import wandb
+# # Define the function that will train and log results for each sweep
+# def train_rnn(config):
+#     # Initialize the run for the sweep
+#     wandb.init(config=config)
 
-    # Initialize sweep by passing in config.
-    sweep_id = wandb.sweep(sweep=sweep_configuration, project=model.filename)
+#     # Select the dataset for the current run
+#     dataset = config.dataset_name
+#     print(f"Training on {dataset} dataset...")
 
-    def objective():
-        run = wandb.init()  # noqa: F841
+#     # Extract hyperparameters from the config
+#     learning_rate = config.learning_rate
+#     batch_size = config.batch_size
+#     hidden_size = config.hidden_size
+#     dropout = config.dropout
 
-        trainer = Trainer(logger=wandb.log, **wandb.config)
-        return trainer.fit(model, data)
+#     # Simulate training and log metrics (replace with actual model training)
+#     for epoch in range(10):
+#         accuracy = random.uniform(0.7, 1.0)  # Simulated accuracy
+#         loss = random.uniform(0.1, 1.0)  # Simulated loss
 
-    # Start sweep job.
-    wandb.agent(sweep_id, function=objective, count=4)
+#         # Log the metrics
+#         wandb.log({"epoch": epoch + 1, "accuracy": accuracy, "loss": loss})
+
+#         # Simulate epoch duration
+#         time.sleep(0.5)
+
+#     wandb.finish()
+
+
+# # Run sweeps for each dataset, passing the dataset name for each experiment
+# for dataset in datasets:
+#     # Update the config for each dataset
+#     config = {
+#         "dataset_name": dataset,
+#     }
+
+#     # Start the sweep agent to run the experiment for the current dataset
+#     wandb.agent(sweep_id, function=train_rnn, count=1)  # Run 1 experiment per dataset

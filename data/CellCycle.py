@@ -1,4 +1,4 @@
-from lib.data import ImageDataModule
+from lib.data import ImageData, DataConfig
 from lib.datasets.image import ImageDataset
 from lib.utils import *
 from lib.dfs import *
@@ -7,10 +7,10 @@ from lib.dfs import *
 from sklearn.model_selection import train_test_split, StratifiedKFold
 
 
-class Brightfield(ImageDataModule):
-    def __init__(self, **kwargs):
+class Brightfield(ImageData):
+    def __init__(self, c: DataConfig):
         super().__init__()
-        self.save_attr()
+        self.save_config(c)
 
         def label_fn(folder):
             classes_to_merge = ["G1", "G2", "S"]  # Classes to merge
@@ -31,6 +31,4 @@ class Brightfield(ImageDataModule):
         self.set_folds(StratifiedKFold(n_splits=5, shuffle=True))
 
     def _to_dataset(self, data):
-        return ImageDataset(
-            data[0], data[1], transform=getattr(self, "transform", None)
-        )
+        return ImageDataset(data[0], data[1], transform=self.transform)

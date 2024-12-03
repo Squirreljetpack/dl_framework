@@ -1,2 +1,4 @@
 .pixi
 *.pth
+wandb
+out

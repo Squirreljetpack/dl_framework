@@ -3,11 +3,18 @@ import torch.nn as nn
 from lib.utils import *
 from lib.modules import *
 
+@dataclass(kw_only=True)
+class RNNConfig(Config):
+    features: int
+    hidden_size: int
+    layers: int
+    flavor: str = "rnn"
+    dropout: float = 0.2
+    y_len: int = 1
+
 
 class RNN(Module):
-    def __init__(
-        self, features, hidden_size, layers, flavor="rnn", dropout=0.2, y_len=1
-    ):
+    def __init__(self, c: RNNConfig):
         """
         Parameters
         ----------
@@ -26,26 +33,26 @@ class RNN(Module):
         """
 
         super().__init__()
-        self.save_attr()
-        dropout = dropout if layers > 1 else 0
+        self.save_config(c)
+        dropout = c.dropout if c.layers > 1 else 0
 
-        self.layernorm = nn.LayerNorm(features)
+        self.layernorm = nn.LayerNorm(c.features)
         # batch first changes in and out dimensions to (batch_size, num_steps, features/hidden_size)
-        if flavor == "lstm":
+        if c.flavor == "lstm":
             self.rnn = nn.LSTM(
-                features, hidden_size, layers, dropout=dropout, batch_first=True
+                c.features, c.hidden_size, c.layers, dropout=dropout, batch_first=True
             )
-        elif flavor == "gru":
+        elif c.flavor == "gru":
             self.rnn = nn.GRU(
-                features, hidden_size, layers, dropout=dropout, batch_first=True
+                c.features, c.hidden_size, c.layers, dropout=dropout, batch_first=True
             )
         else:
             self.rnn = nn.RNN(
-                features, hidden_size, layers, dropout=dropout, batch_first=True
+                c.features, c.hidden_size, c.layers, dropout=dropout, batch_first=True
             )
 
         self.fc = nn.Sequential(
-            nn.Linear(hidden_size, 1),
+            nn.Linear(c.hidden_size, 1),
         )
 
     def forward(self, x, state=None):

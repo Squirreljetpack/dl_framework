@@ -1,14 +1,20 @@
 from sklearn.discriminant_analysis import StandardScaler
 from lib.datasets.datasets import SeqDataset
 from lib.utils import *
-from lib.data import *
+from lib.data import Data, DataConfig
 import pandas as pd
 from sklearn.model_selection import KFold
 
-class AQ(DataModule):
-    def __init__(self, y_len=1, seq_len=9, **kwargs):
-        super().__init__(**kwargs)
-        self.save_attr()
+@dataclass(kw_only=True)
+class AQConfig(DataConfig):
+    y_len: int = 1
+    seq_len: int = 9
+
+
+class AQ(Data):
+    def __init__(self, c: DataConfig):
+        super().__init__()
+        self.save_config(c)
 
         target = "C6H6(GT)"
 
@@ -42,7 +48,7 @@ class AQ(DataModule):
         df = df.interpolate(method="linear")  # Interpolate missing values
         X, y = df.drop(target, axis=1), df[[target]]
 
-        self.data = (X, y)
+        self.set_data(X, y)
         self.set_folds(KFold(n_splits=6))
 
     def _to_dataset(self, data):
@@ -56,3 +62,7 @@ class AQ(DataModule):
             return lambda v: q.transform(v)
 
         return tuple(transform(t) for t in tensors)
+
+def k():
+    if vb(5):
+        dbg(5)
