@@ -3,6 +3,37 @@ from typing import List, Union
 import polars as pl
 import pandas as pd
 import polars.selectors as cs
+from typing import Sequence
+import polars.datatypes as datatypes
+
+
+@pl.api.register_dataframe_namespace("custom")
+@pl.api.register_lazyframe_namespace("custom")
+class CustomFrame:
+    def __init__(self, df: pl.DataFrame | pl.LazyFrame):
+        if isinstance(df, pl.DataFrame):
+            self._df = df.lazy()
+            self._was_df = True
+        else:
+            self._df = df
+            self._was_df = False
+
+
+# https://docs.pola.rs/api/python/stable/reference/api.html
+@pl.api.register_expr_namespace("custom")
+class CustomExpr:
+    def __init__(self, expr: pl.Expr) -> None:
+        self._expr = expr
+
+
+def add_to_class(cls):
+    """Decorator to add a function as a method to the given class."""
+
+    def decorator(func):
+        setattr(cls, func.__name__, func)
+        return func
+
+    return decorator
 
 
 def drop_nulls(df):
@@ -46,9 +77,9 @@ def preview_df(frame, head=True, glimpse=True, tail=True, describe=True):
 
 def process_categoricals(
     df: Union[pl.DataFrame, pd.DataFrame],
-    categorical_cols: List[str],
+    categorical_cols: List[str] = None,
     prefix_sep: str = "_",
-    impute=None,
+    impute="mode",
     drop_first=True,
 ) -> pl.DataFrame:
     """
@@ -64,16 +95,15 @@ def process_categoricals(
         Polars DataFrame with imputed and encoded categorical columns
     """
 
-    # Store modes and unique values for each column
-    modes = {}
     if not categorical_cols:
         categorical_cols = df.select(cs.categorical() | cs.string()).columns
         logging.info("Guessing Categorical columns: ", categorical_cols)
 
-    if impute is None:
-        for col in categorical_cols:
-            modes[col] = df.select(pl.col(col).mode().first()).item()
-        impute = [pl.col(col).fill_null(modes[col]) for col in categorical_cols]
+    if impute == "mode":
+        impute = [
+            pl.col(col).fill_null(pl.col(col).mode().first())
+            for col in categorical_cols
+        ]
 
     # Apply imputation
     processed_df = df.with_columns(impute)
@@ -89,55 +119,94 @@ def process_nulls():
     return
 
 
-def drop_null_rows(df: pl.DataFrame, min_percent: float, target=[]) -> pl.DataFrame:
-    def count_null(row: dict) -> int:
-        y = sum(1 for x in row.values() if x is not None)
-        return y
+@add_to_class(CustomFrame)
+def dropna(
+    self: pl.LazyFrame,
+    how: str = "any",
+    thresh: int = None,
+    subset: str | Sequence[str] = None,
+) -> pl.LazyFrame:
+    """
+    Remove null and NaN values https://stackoverflow.com/questions/73971106/polars-dropna-equivalent-on-list-of-columns
+    """
+    df = self._df
 
-    target_columns = [target] if isinstance(target, str) else target
-    threshold = (len(df.columns) * min_percent) // 100
-    df = df.drop_nulls(subset=target_columns)
+    if subset is None:
+        subset = cs.all()
+    else:
+        subset = cs.by_name(subset)
+
+    num_subset = cs.numeric() & subset
+
+    # todo: fix
+    expr = subset.is_not_null() & num_subset.is_not_nan()
+
+    if thresh is not None:
+        result = df.filter(pl.sum_horizontal(expr) >= thresh)
+    elif how == "any":
+        result = df.filter(pl.all_horizontal(expr))
+    elif how == "all":
+        result = df.filter(pl.any_horizontal(expr))
+    else:
+        ...
+
+    result = df._from_pyldf(result._ldf)
+
+    return result.collect() if self._was_df else result
+
+
+def drop_rows(
+    df: pl.DataFrame,
+    threshold: float | int = 1,
+    col_expr=None,
+    count_null=lambda row: sum(1 for x in row.values() if x is None),
+) -> pl.DataFrame:
+    col_expr = pl.all() if col_expr is None else col_expr
+
+    threshold = (
+        threshold
+        if isinstance(threshold, int)
+        else (df.select(col_expr).width * threshold)
+    )
+
     df = df.filter(
         pl.sum_horizontal(
-            pl.struct(pl.all()).map_elements(count_null, return_dtype=pl.Int64)
+            pl.struct(col_expr).map_elements(count_null, return_dtype=pl.Int64)
         )
-        >= threshold
+        < threshold
     )
     return df
 
 
-def drop_null_cols(df):
+def drop_cols(
+    df, col_expr=None, drop_criterion=lambda col: any(e is not None for e in col)
+):
+    col_expr = pl.all() if col_expr is None else col_expr
+
     return df.select(
         col.name
         for col in df.select(
-            pl.all().map_batches(
-                lambda d: pl.Series([any(e is not None and e != 0 for e in d)])
-            )
+            col_expr.map_batches(lambda col: pl.Series([not drop_criterion(col)]))
         )
         if col.all()
     )
 
+@add_to_class(CustomExpr)
+def clean_numeric(self: pl.Expr) -> pl.Expr:
+    """Converts string to numeric column by dropping non-numeric characters
 
-@pl.api.register_expr_namespace("dfs")
-class Dfs:
-    def __init__(self, expr: pl.Expr) -> None:
-        self._expr = expr
+    Returns:
+        pl.Expr
 
-    def clean_numeric(self) -> pl.Expr:
-        """Converts string to numeric column by dropping non-numeric characters
-
-        Returns:
-            pl.Expr
-
-        Example:
-            df.with_columns(
-                pl.col("Fiber_Diameter_(µm)").my.clean_numeric()
-            )
-        """
-        return (
-            self._expr.str.replace_all(
-                r"[^0-9.]", ""
-            ).cast(  # Replace non-digit and non-dot characters
-                pl.Float64
-            )  # Cast to Float64
+    Example:
+        df.with_columns(
+            pl.col("Fiber_Diameter_(µm)").my.clean_numeric()
         )
+    """
+    return (
+        self._expr.str.replace_all(
+            r"[^0-9.]", ""
+        ).cast(  # Replace non-digit and non-dot characters
+            pl.Float64
+        )  # Cast to Float64
+    )

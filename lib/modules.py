@@ -3,7 +3,7 @@ from torch.nn import functional as F
 
 from .utils import *
 
-
+# Do not use properties beginning with _
 class Module(nn.Module, Base):
     """The base class of models."""
 
@@ -42,6 +42,10 @@ class Module(nn.Module, Base):
             X = layer(X)
             print(layer.__class__.__name__, "output shape:\t", X.shape)
 
+    def show(self):
+        for p in self.named_parameters():
+            print(p)
+
 
 # Just a reminder of basic field names, better to declare all fields when subclassing and subclass Config instead
 @dataclass(kw_only=True)
@@ -62,11 +66,25 @@ class Classifier(Module):
         Y = Y.reshape(
             -1,
         )
-        return F.cross_entropy(outputs, Y, reduction="mean" if averaged else "none")
+        loss = F.cross_entropy(outputs, Y, reduction="mean" if averaged else "none")
+        return loss
 
     # Used in evaluation/metrics steps, which compare pred(output) and label
     def pred(self, output):
         return output.argmax(dim=-1).to(torch.int64)
+
+    # test manual computation agrees
+    def _softmax(self, logits):
+        exp_logits = np.exp(
+            logits - np.max(logits, axis=1, keepdims=True)
+        )  # Stability trick
+        return exp_logits / np.sum(exp_logits, axis=1, keepdims=True)
+
+        # probs = self.softmax(outputs.cpu().detach().numpy())
+
+        # true_probs = probs[np.arange(len(Y)), Y.cpu().numpy()]
+
+        # nloss = -np.mean(np.log(true_probs))
 
 
 class MultiClassifier(Module):

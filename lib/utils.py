@@ -138,7 +138,7 @@ class Base:
         try:
             return self.gpus[0]
         except:  # noqa: E722
-            return "cpu" ""
+            return "cpu"
 
     def defined_or_self(self, variable_names):
         """
@@ -304,7 +304,7 @@ def to_tensors(arr, **kwargs):
     """Coerce into Tensor"""
     if isinstance(arr, torch.Tensor):
         return arr.to(**kwargs)
-    kwargs.setdefault("dtype", torch.float32)
+    kwargs.setdefault("dtype", torch.float32)  # np is 64 but torch is 32
     if isinstance(arr, np.ndarray):
         return torch.tensor(arr, **kwargs)
     if isinstance(arr, pl.DataFrame):
@@ -398,3 +398,31 @@ def get_project_name():
     caller_file = caller_frame.filename
     filename = os.path.splitext(os.path.basename(caller_file))[0]
     return f"{repo_name}_{filename}"
+
+
+def tolist(series):
+    if isinstance(series, pl.Series):
+        return series.to_list()
+    elif isinstance(series, pd.Series):
+        return series.to_list()
+    elif isinstance(series, np.ndarray):
+        return series.tolist()
+    elif isinstance(series, torch.Tensor):
+        return series.tolist()
+    else:
+        return list(series)
+
+
+def _grad(out, inp):
+    return torch.autograd.grad(
+        out,
+        inp,
+        grad_outputs=torch.ones_like(inp),
+        create_graph=True,
+        allow_unused=True,
+    )[0]
+
+
+def numpy_flatten(x):
+    x = x.numpy() if isinstance(x, torch.Tensor) else x
+    return x.flatten()

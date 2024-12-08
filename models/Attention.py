@@ -3,7 +3,6 @@ import torch
 import torch.nn.functional as F
 import math
 from lib.modules import Classifier, Module
-from lib.utils import dbg
 
 """From d2l"""
 
@@ -64,6 +63,7 @@ class MultiHeadAttention(Module):
         self.W_k = nn.LazyLinear(hidden_size, bias=bias)
         self.W_v = nn.LazyLinear(hidden_size, bias=bias)
         self.W_o = nn.LazyLinear(hidden_size, bias=bias)
+        self.s
 
     def forward(self, queries, keys, values, valid_lens):
         # Transforms the last dimension of each input: (batch_size, num_queries/num_keys = num_values, query/key/value size -> hidden_size)

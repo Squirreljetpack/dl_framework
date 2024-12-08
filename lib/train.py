@@ -12,19 +12,26 @@ from . import infer
 import torcheval.metrics as ms
 from .metrics import *
 from .config import *
+from torch.optim.lr_scheduler import OneCycleLR
 
 if is_notebook():
     from tqdm.notebook import tqdm as tqbar
 else:
     from tqdm import tqdm as tqbar
 
+
 @dataclass(kw_only=True)
-class TrainerConfig(Config):
+class OptimizerConfig(Config):
+    lr: float = 0.1
+    weight_decay: float = 0.01
+    betas: Optional[tuple] = None
+
+
+@dataclass(kw_only=True)
+class TrainerConfig(OptimizerConfig):
     max_epochs: int = 200
     gpus: Optional[List[int]] = None  # Optional list of GPUs to use
     gradient_clip_val: float = 0.0
-    lr: float = 0.1
-    weight_decay: float = 0.01
     save_model: bool = False
     load_previous: bool = False
     save_loss_threshold: float = 1.0
@@ -32,16 +39,25 @@ class TrainerConfig(Config):
     verbosity: int = 0
     train_mfs: MetricsFrame | List[MetricsFrame] = field(default_factory=list)
     val_mfs: MetricsFrame | List[MetricsFrame] = field(default_factory=list)
+    batch_end_callback: Callable | List[Callable] = field(default_factory=list)
+    epoch_end_callback: Callable | List[Callable] = field(default_factory=list)
     loss_every: float = 0.2  # record loss every n epochs
     flush_mfs: bool = True
     flush_epoch_units: bool = True
     set_pred: bool = True  # use model.pred as the predictor function for metric frames
     save_path: str | Path = "./out"
+    use_dataparallel: bool = False
+    scheduler: Optional[
+        Callable[
+            [torch.optim.Optimizer, int, int], torch.optim.lr_scheduler.LRScheduler
+        ]
+    ] = None
 
 
 class Trainer(Base):
     def __init__(self, c: TrainerConfig):
         self.save_config(c, ignore=["loaders"])
+        self.optimizer_config = OptimizerConfig.create(c)
         if not c.gpus:
             self.gpus = get_gpus(-1)  # get all gpus by default
         self.tunable = ["lr", "weight_decay"]  # affects saved model name
@@ -51,34 +67,44 @@ class Trainer(Base):
     def prepare_optimizers(self, **kwargs):
         self.optim = torch.optim.AdamW(
             self.model.parameters(),
-            lr=self.lr,
-            weight_decay=self.weight_decay,
+            **self.optimizer_config.dict(),
             **kwargs,
         )
 
-    def prepare_batch(self, batch):
-        return batch  # Handled by DataParallel
+        if self.scheduler:
+            self._sched = self.scheduler(
+                self.optim,
+                self.num_train_batches,
+                self.max_epochs,
+            )
+        else:
+            self._sched = None
 
-        if self.gpus:
+    def prepare_batch(self, batch):
+        if self.use_dataparallel:
+            return batch  # Handled by DataParallel
+        else:
             return [a.to(self.device) for a in batch]  # Move batch to the first device
 
     @property
     def num_train_batches(self):
-        return len(self.train_dataloader) if self.train_dataloader is not None else 0
+        return len(self.train_loader) if self.train_loader is not None else 0
 
     @property
     def num_val_batches(self):
-        return len(self.val_dataloader) if self.val_dataloader is not None else 0
+        return len(self.val_loader) if self.val_loader is not None else 0
 
     def prepare_model(self, model):
         self._loaded = False
-        self._model = model  # store a reference
         # Easy way to run on gpu, better to use the following
         # https://pytorch.org/tutorials/intermediate/ddp_tutorial.html
-        self.model = nn.DataParallel(model, self.gpus)
+        if self.use_dataparallel:
+            self.model = nn.DataParallel(model, self.gpus)
+        else:
+            self.model = model.to(self.device)
 
         if self.load_previous:
-            params = self.__load_previous()
+            params = self.__load_previous(model)
             if params is not None:
                 self._loaded = True
                 # if not self.gpus and params["gpus"]:
@@ -90,11 +116,12 @@ class Trainer(Base):
             self.prepare_optimizers()
             self.first_epoch = 0
 
-        # Inherit some overrideable functions/attributes
-        if getattr(self, "loss", None) is None:
-            self.loss = model.loss
+        self.loss = getattr(self, "loss", model.loss)
+        self._model = model
+        model.trainer = self
 
-        logging.debug(self.model.named_parameters())
+        # if vb(10):
+        #     print(self.model.named_parameters())
 
     def prepare_metrics(self, loss_board=None):
         """Prepare metrics
@@ -131,6 +158,8 @@ class Trainer(Base):
 
         self.val_mfs = k_level_list(self.val_mfs, k=1)
         self.train_mfs = k_level_list(self.train_mfs, k=1)
+        self.batch_end_callback = k_level_list(self.batch_end_callback, k=1)
+        self.epoch_end_callback = k_level_list(self.epoch_end_callback, k=1)
 
         for mf in self.train_mfs:
             mf.train = True
@@ -173,7 +202,7 @@ class Trainer(Base):
         )
 
     def init(self, model=None, loaders=None, loss_board=None):
-        """(Re)initialize model, dataloaders, metric frames. Will error if any are not already initialized.
+        """(Re)initialize model, loaders, metric frames. Will error if any are not already initialized.
         Useful if you want to further customize initialized objects such as trainer.val_loss_mf before calling trainer.fit(init=False).
         Set loss_board to False to disable loss plotting.
 
@@ -182,8 +211,8 @@ class Trainer(Base):
             loaders (_type_, optional): _description_. Defaults to None.
         """
         if loaders:
-            self.train_dataloader = loaders[0]
-            self.val_dataloader = loaders[1] if len(loaders) > 1 else None
+            self.train_loader = loaders[0]
+            self.val_loader = loaders[1] if len(loaders) > 1 else None
         if model:
             self.prepare_model(model)
         self.prepare_metrics(loss_board=loss_board)
@@ -223,6 +252,8 @@ class Trainer(Base):
             epoch_bar.set_description(
                 "Epochs progress [Loss: {:.3e}]".format(epoch_loss)
             )
+            for c in self.epoch_end_callback:
+                c()
 
         for b in self.boards:
             b.close()  # Close as many plots as are associated, a bit wonky but works ok
@@ -234,26 +265,30 @@ class Trainer(Base):
                     pass
         return self._best_loss
 
-    def _fit_epoch(self, train_dataloader=None, val_dataloader=None, y_len=1):
-        train_dataloader = train_dataloader or self.train_dataloader
-        val_dataloader = val_dataloader or self.val_dataloader
+    def _fit_epoch(self, train_loader=None, val_loader=None, y_len=1):
+        train_loader = train_loader or self.train_loader
+        val_loader = val_loader or self.val_loader
 
-        self.model.train()
         losses = 0
-        for batch in train_dataloader:
-            outputs = self.model(*batch[:-y_len])
-            Y = batch[-y_len:]
-            loss = self.loss(
-                outputs, Y[-1].to(self.device)
-            )  # Sending to the main gpu generalizes to a distributed process
-            self.optim.zero_grad()
+        self.model.train()
+        for batch in train_loader:
+            batch = self.prepare_batch(batch)
+            with torch.set_grad_enabled(True):
+                outputs = self.model(*batch[:-y_len])
+                Y = batch[-y_len:]
+                loss = self.loss(
+                    outputs, Y[-1].to(self.device)
+                )  # Sending to the main gpu generalizes to a distributed process
+                self.optim.zero_grad()
             with torch.no_grad():
                 loss.backward()
-                if val_dataloader is None:
+                if val_loader is None:
                     losses += loss
                 if self.gradient_clip_val > 0:
                     self.clip_gradients(self.gradient_clip_val, self.model)
                 self.optim.step()
+                if self._sched is not None:
+                    self._sched.step()
 
                 for m in self.train_mfs:
                     m.update(
@@ -268,19 +303,22 @@ class Trainer(Base):
                         batch_num=self.train_batch_idx,
                         batches_per_epoch=self.num_train_batches,
                     )
+                # if self.model_mf:
+                #     self.model_mf.update(self.model)
             self.train_batch_idx += 1
+            for c in self.batch_end_callback:
+                c()
 
             # debug
-            # if vb(10):
-            #     for param in self.model.named_parameters():
-            #         if param[1].grad is None:
-            #             print("No gradient for parameter:", param)
-            #         elif torch.all(param[1].grad == 0):
-            #             print("Zero gradient for parameter:", param)
+            # for param in self.model.named_parameters():
+            #     if param[1].grad is None:
+            #         print("No gradient for parameter:", param)
+            #     elif torch.all(param[1].grad == 0):
+            #         print("Zero gradient for parameter:", param)
 
-        if val_dataloader is not None:
+        if val_loader is not None:
             self.model.eval()  # Set the model to evaluation mode, this disables training specific operations such as dropout and batch normalization
-            for batch in val_dataloader:
+            for batch in map(self.prepare_batch, val_loader):
                 with torch.no_grad():
                     outputs = self.model(*batch[:-y_len])
                     Y = batch[-y_len:]
@@ -300,6 +338,9 @@ class Trainer(Base):
                             batches_per_epoch=self.num_train_batches,
                         )
                 self.val_batch_idx += 1
+                if vb(6):
+                    if self.epoch == self.first_epoch + self.max_epochs - 1:
+                        print("validation outputs", outputs)
 
         epoch_loss = losses / self.num_train_batches
         for b in self.boards:
@@ -361,11 +402,11 @@ class Trainer(Base):
     #     torchevals=[],
     #     batch_fun=None,
     #     pred_funs=None,
-    #     dataloader=None,
+    #     loader=None,
     #     loss=False,
     # ):
     #     """
-    #     Evaluates the model on a given dataloader and computes the metrics and/or loss.
+    #     Evaluates the model on a given loader and computes the metrics and/or loss.
 
     #     Args:
     #         torchevals (list, optional): List of evaluation metrics or metric groups to be updated during evaluation.
@@ -374,12 +415,12 @@ class Trainer(Base):
     #         pred_funs (list, optional): List of prediction functions to be applied to the model outputs.
     #                                     By default, will apply model.pred to group 1 if defined. If torch_evals is longer, the groups use output directly: i.e. m.update(outputs, *Y)
     #         batch_fun (function, optional): Custom definition of function that is applied with batch_fun(outputs, *Y) to each batch. If not supplied, will update supplied torchevals using pred_funs, then output [predictions] or [predictions, loss].
-    #         dataloader (DataLoader, optional): The DataLoader to iterate through during evaluation. If None,
-    #                                             defaults to `self.val_dataloader`.
+    #         loader (DataLoader, optional): The DataLoader to iterate through during evaluation. If None,
+    #                                             defaults to `self.val_loader`.
     #         loss (bool, optional): Whether to output batch_loss in batch_fun. Defaults to False. A custom loss function can also be supplied.
 
     #     Returns:
-    #         tuple: List of metrics, as many as are output by batch_fun. Tensor type metrics are concatenated, while others are arrays of len(dataloader).
+    #         tuple: List of metrics, as many as are output by batch_fun. Tensor type metrics are concatenated, while others are arrays of len(loader).
     #             updated metrics, and the second element is the computed loss if requested.
     #     """
     #     assert getattr(self, "_model", None) is not None
@@ -395,7 +436,7 @@ class Trainer(Base):
 
     #     return infer.infer(
     #         self.model,
-    #         dataloader or self.val_dataloader,
+    #         loader or self.val_loader,
     #         batch_fun,
     #         device=self.device,
     #     )
@@ -405,21 +446,22 @@ class Trainer(Base):
         mfs: Union[MetricsFrame, List[MetricsFrame]] = [],
         pred: Union[Callable, bool] = False,
         loss: Union[Callable, bool] = False,
-        dataloader: torch.utils.data.DataLoader = None,
+        loader: torch.utils.data.DataLoader = None,
         batch_fun=None,
+        flush_zero_flush_every_mfs=True,
     ):
-        """Evaluates the model on a given dataloader and updates the given MetricFrames on the output. Also computes loss/pred if specified.
+        """Evaluates the model on a given loader and updates the given MetricFrames on the output. Also computes loss/pred if specified.
 
         Args:
             mfs (Union[MetricsFrame, List[MetricsFrame]], optional): _description_. Defaults to [].
             pred (Union[Callable, bool], optional): Whether to track model predictions. Defaults to False. A custom pred function can also be supplied.
             loss (Union[Callable, bool], optional): Whether to track loss. Defaults to False. A custom loss function can also be supplied. Defaults to False.
-            dataloader (DataLoader, optional): The DataLoader to iterate through during evaluation. If None,
-                defaults to `self.val_dataloader`.
+            loader (DataLoader, optional): The DataLoader to iterate through during evaluation. If None,
+                defaults to `self.val_loader`.
             batch_fun (Callable, optional): _description_. Defaults to None.
 
         Returns:
-            A MetricFrame with loss and/or pred columns. None if loss and pred are both unspecified.
+            A dictionary with loss and/or pred columns. None if loss and pred are both unspecified.
         """
         assert getattr(self, "_model", None) is not None
         mfs = k_level_list(mfs, k=1)
@@ -430,7 +472,7 @@ class Trainer(Base):
         if pred is not False:
             output_cols.append(
                 CatMetric(
-                    "preds",
+                    "pred",
                     update=lambda x, *ys: (pred_fn(x),),
                     num_outs=1,
                     device=self.device,
@@ -462,8 +504,8 @@ class Trainer(Base):
 
         if loss is not False or pred is not False:
             output_mf = MetricsFrame(
-                output_cols, flush_every=1, xlabel="batch_num", index_fn=lambda x, y: x
-            )
+                output_cols, flush_every=0, xlabel=None, index_fn=lambda x, y: x
+            )  # output concatenation at end
             mfs.append(output_mf)
 
         # for mf in mfs:
@@ -476,17 +518,19 @@ class Trainer(Base):
                 for mf in mfs:
                     mf.update(*args, batch_num=batch_num)
 
-        dataloader = dataloader or self.val_dataloader
+        loader = loader or self.val_loader
 
         infer.infer(
             self.model,
-            dataloader,
+            loader,
             batch_fun,
             device=self.device,
         )
 
-        for mf in mfs:
-            mf.flush(mf._count)
+        if flush_zero_flush_every_mfs:
+            for mf in mfs:
+                if mf.flush_every == 0:
+                    mf.flush()
 
         if output_mf is not None:
             return mfs.pop().dict
@@ -518,9 +562,9 @@ class Trainer(Base):
             )
 
     # load a previous model to train further
-    def __load_previous(self):
+    def __load_previous(self, model):
         with change_dir(self.save_path):
-            files = glob.glob(self._model.filename + "_epoch*.pth")
+            files = glob.glob(model.filename + "_epoch*.pth")
             # look for the most recent file
             files.sort(key=os.path.getmtime)
             if len(files) > 0:

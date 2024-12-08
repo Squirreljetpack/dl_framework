@@ -1,6 +1,7 @@
 from collections import Counter
 import random
 import re
+from sklearn.model_selection import KFold
 import torch
 from lib import dfs
 from lib.datasets.datasets import SubDataset
@@ -21,9 +22,10 @@ class DataConfig(Config):
     data: Optional[Any] = None
     dataset: Optional[Any] = None
     batch_size: int = 32
-    num_workers: int = field(default_factory=os.cpu_count)
+    num_workers: int = field(default_factory=lambda: os.cpu_count() - 2)
     sampler: Optional[Any] = None
     transform: Any = None
+    shuffle: Optional[bool] = None
 
 # used in wandb
 @dataclass(kw_only=True)
@@ -66,6 +68,7 @@ class Data(Base):
         tensors = (to_tensors(x) for x in data)
         return td.TensorDataset(*tensors)
 
+    # prefer not to use this as it doesn't apply to test set
     def _fit_transforms(self, tensors):
         def transform(t):
             return lambda x: x
@@ -73,6 +76,9 @@ class Data(Base):
         return tuple(transform(t) for t in tensors)
 
     def _transform_val(self, tensors, transforms):
+        if (len_diff := len(tensors) - len(transforms)) > 0:
+            transforms = list(transforms)
+            transforms += [lambda x: x] * len_diff
         for i, t in enumerate(tensors):
             transforms[i](t)
 
@@ -111,7 +117,7 @@ class Data(Base):
         loader_args: List[Dict] = None,
         **kwargs,
     ):
-        """returns train_dataloader, val_dataloader
+        """returns train_loader, val_loader
         **kwargs: passed to train DataLoader
         split: Tuple of indices that determines how to split the dataset. Prevents splitting if set to False. Controlled by set_folds otherwise.
         loader_args: List of kwargs zipped to loaders. If there are more loaders than loader_args, the last dict is repeated. If not supplied, loader_args=[kwargs].
@@ -124,10 +130,11 @@ class Data(Base):
             nonlocal split
             nonlocal kwargs
 
+            # either apply same kwargs to all loaders, or supply a list
             loader_args = loader_args or [kwargs]
             loader_args += [loader_args[-1].copy()] * (len(sets) - len(loader_args))
 
-            # Allow setting some dataloader args on data class itself
+            # Allow setting some loader args on data class itself
             for ix, la in enumerate(loader_args):
                 # Note: batch_sampler is identical to sampler+fixed batch_size
                 for key in ["batch_size", "num_workers", "sampler", "shuffle"]:
@@ -140,8 +147,9 @@ class Data(Base):
                                     la[key] = self.sampler(self, split[ix])
                         elif key == "shuffle":
                             if ix == 0 and "sampler" not in la.keys():
-                                la[key] = getattr(
-                                    self, "shuffle", True
+                                _shuffle = getattr(self, "shuffle", None)
+                                la[key] = (
+                                    _shuffle if _shuffle is not None else True
                                 )  # shuffle=True shuffles the data after every epoch
                         elif (attr := getattr(self, key, None)) is not None:
                             la[key] = attr
@@ -184,7 +192,7 @@ class Data(Base):
             dtypes += [torch.float32] * (len(self.data) - len(dtypes))
 
             train_arr = list(row_index(a, split[0]) for a in self.data)
-            # if isinstance(self, ClassifierModule):
+            # if isinstance(self, ClassifierData):
             #     train_arr[-1] = train_arr[-1].to(torch.int64)
             transforms = self._fit_transforms(train_arr)
             train_set = self._to_dataset(train_arr)
@@ -194,13 +202,44 @@ class Data(Base):
             else:
 
                 def to_val_set(indices):
-                    val_array = list(row_index(a, indices) for a in self.data)
+                    val_array = [row_index(a, indices) for a in self.data]
                     self._transform_val(val_array, transforms)
                     return self._to_dataset(val_array)
 
                 return _loaders(train_set, *(to_val_set(ixs) for ixs in split[1:]))
 
-    def set_folds(self, split_method):  #
+    def test_loader(self, test_set=None, **kwargs):
+        test_set = test_set or self.test_dataset or self.test_data
+        assert test_set is not None
+
+        if not isinstance(test_set, td.Dataset):
+            test_set = self._to_dataset(test_set)
+
+        # Allow setting some loader args on data class itself
+        # todo: auto detect best batch size
+        for key in ["batch_size", "num_workers"]:
+            if (attr := getattr(self, key, None)) is not None:
+                kwargs[key] = attr
+
+        return td.DataLoader(test_set, **kwargs)
+
+    def data_range(
+        self, loader_index, batch_index, range=None
+    ):  # assuming tensors, todo: improve
+        loader = iter(self.loaders(shuffle=False)[loader_index])
+        outs = next(loader)[batch_index]
+        while True:
+            try:
+                next_batch = next(loader)[batch_index]
+                outs = torch.cat((outs, next_batch), dim=0)
+            except StopIteration:
+                break
+        if range:
+            return outs[range]
+        else:
+            return outs
+
+    def set_folds(self, split_method):
         """Configure folds
 
         Args:
@@ -344,7 +383,7 @@ class DataFromLoader(Data):
         return self.train_loader, self.val_loader
 
 
-class ClassifierModule(Data):
+class ClassifierData(Data):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.save_attr()
@@ -380,7 +419,7 @@ class ClassifierModule(Data):
             show_counts (bool, optional): Displays data counts on non-test initialization. Defaults to True.
         """
         self.le = LabelEncoder()
-        labels = args[-1]
+        labels = tolist(args[-1])  # counter needs a hashable type
 
         data = tuple(np.array(a) if isinstance(a, List) else a for a in args[:-1]) + (
             torch.tensor(self.le.fit_transform(labels), dtype=torch.int64),
@@ -404,7 +443,7 @@ class ClassifierModule(Data):
 
     def show_counts(self, test=False):
         assert all((self.counts, self.data, self.le))
-        print("data[-1] counts in label order from 0")
+        print("data[-1] counts in label order from 0:")
         for k, v in self.counts:
             print(f"{k}: {v}")
 
@@ -436,7 +475,7 @@ class ClassifierModule(Data):
         return inner
 
 
-class ImageData(ClassifierModule):
+class ImageData(ClassifierData):
     # Use set_data
     def _paths_and_labels_from_folder(
         self,

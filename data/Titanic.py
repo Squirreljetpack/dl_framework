@@ -11,7 +11,7 @@ import polars.selectors as cs
 from sklearn.model_selection import KFold
 
 
-class Titanic(ClassifierModule):
+class Titanic(ClassifierData):
     def __init__(self, c: DataConfig):
         super().__init__()
         self.save_config(c)
@@ -25,7 +25,7 @@ class Titanic(ClassifierModule):
 
         # df = dfs.drop_null_rows(df, 50, target)
         X = df.drop([target, "Name"])
-        y = df.select(target)
+        y = df[target]
 
         # self.classes = int(df.select(pl.col(target).n_unique()).to_numpy())
 
@@ -68,4 +68,4 @@ class Titanic(ClassifierModule):
             q.fit_transform(t)
             return lambda v: q.transform(v)
 
-        return [transform_X(t) for t in tensors[:-1]] + [lambda x: x]
+        return [transform_X(tensors[0])]

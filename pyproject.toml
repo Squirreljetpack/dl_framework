@@ -3,7 +3,7 @@ name = "A3"
 version = "0.1.0"
 requires-python = ">=3.9"
 # pip
-dependencies = [ "flask", "torcheval>=0.0.7,<0.0.8"]
+dependencies = [ "torcheval>=0.0.7,<0.0.8"]
 
 [tool.pixi.environments]
 # test = {features = ["test"], solve-group = "default"}
@@ -17,6 +17,8 @@ dev = {features = ["dev"], solve-group = "default"}
 # dev = [{include-group = "test"}]
 [tool.pixi.feature.dev.dependencies]
 pytest = "*"
+jupyter-ai = { version = ">=2.28.2,<3", channel = "conda-forge" }
+langchain-openai = { version = ">=0.1.25,<0.2", channel = "conda-forge" }
 
 [tool.pixi.project]
 channels = ["conda-forge"]

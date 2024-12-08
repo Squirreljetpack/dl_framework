@@ -104,7 +104,7 @@ class CatMetric(Metric):
         for idx, tensor in enumerate(self._store):
             new = args[idx]
             self._store[idx] = torch.cat(
-                [tensor, new.unsqueeze(0) if new.dim() == 0 else new], dim=0
+                [tensor, new.flatten() if new.dim() == 0 else new], dim=0
             )
 
     @torch.inference_mode()
@@ -521,8 +521,10 @@ class ProgressBoard(Base):
         if self.interactive:
             self.dh.update(self.fig)
 
-def plot_2dheatmap(arr, **kwargs):
-    plt.close("all")
+def plot_2dheatmap(arr, close_last=True, **kwargs):
+    # if close_last:  # useful for single plots
+    #     plt.close("all")
+    plt.figure()
     sns.heatmap(
         [[int(el) for el in row] for row in arr],
         annot=True,

@@ -62,7 +62,3 @@ class AQ(Data):
             return lambda v: q.transform(v)
 
         return tuple(transform(t) for t in tensors)
-
-def k():
-    if vb(5):
-        dbg(5)

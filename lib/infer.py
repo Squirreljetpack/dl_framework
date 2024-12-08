@@ -9,13 +9,13 @@ else:
 
 
 @torch.inference_mode()
-def infer(model, dataloader, batch_fun=lambda x, y: x, y_len=1, device="cpu"):
+def infer(model, loader, batch_fun=lambda x, y: x, y_len=1, device="cpu"):
     """
-    Performs inference on a given model using a dataloader, updating batch-level metrics using the provided function.
+    Performs inference on a given model using a loader, updating batch-level metrics using the provided function.
 
     Args:
         model (torch.nn.Module): The model to run inference on.
-        dataloader (DataLoader): The DataLoader to provide batches of data for inference.
+        loader (DataLoader): The DataLoader to provide batches of data for inference.
         batch_fun (function, optional): A function that processes the model's predictions and the true values
                                         for each batch and returns a list of computations. Defaults to just returns the model output.
         y_len (int, optional): The number of elements in the target batch. Defaults to 1.
@@ -31,9 +31,10 @@ def infer(model, dataloader, batch_fun=lambda x, y: x, y_len=1, device="cpu"):
     batch_metrics = []
     batch_num = 0
 
-    for _, batch in tqbar(enumerate(dataloader)):
+    for _, batch in tqbar(enumerate(loader)):
+        batch = [a.to(device) for a in batch]
         outputs = model(*batch[:-y_len]).to(device)
-        Y = (b.to(device) for b in batch[-y_len:])
+        Y = list(b.to(device) for b in batch[-y_len:])
         computed = batch_fun(outputs, *Y, batch_num=batch_num)
         if isinstance(computed, List):
             if len(batch_metrics) == 0:  # instantiate
@@ -63,8 +64,8 @@ def eval_classifier(trainer):
     return [m.compute() for m in metrics]
 
 
-def loader_columns(dataloader, columns=slice(-1, None), cpu=True):
-    outs = [batch[columns] for batch in dataloader]
+def loader_columns(loader, columns=slice(-1, None), cpu=True):
+    outs = [batch[columns] for batch in loader]
     out = torch.cat(outs, dim=0)
     if cpu:
         return out.cpu().numpy()
