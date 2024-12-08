@@ -9,7 +9,7 @@ else:
 
 
 @torch.inference_mode()
-def infer(model, loader, batch_fun=lambda x, y: x, y_len=1, device="cpu"):
+def infer(model, loader, batch_fun=lambda x, y: x, y_len=1, device="cpu", tq_bar=False):
     """
     Performs inference on a given model using a loader, updating batch-level metrics using the provided function.
 
@@ -31,7 +31,9 @@ def infer(model, loader, batch_fun=lambda x, y: x, y_len=1, device="cpu"):
     batch_metrics = []
     batch_num = 0
 
-    for _, batch in tqbar(enumerate(loader)):
+    enumerator = tqbar(enumerate(loader)) if tq_bar else enumerate(loader)
+
+    for _, batch in enumerator:
         batch = [a.to(device) for a in batch]
         outputs = model(*batch[:-y_len]).to(device)
         Y = list(b.to(device) for b in batch[-y_len:])

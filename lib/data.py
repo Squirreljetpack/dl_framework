@@ -58,6 +58,7 @@ class Data(Base):
         self._data_inds = None
         self._folds = None
         self._folder = None
+        self.processor = None
 
         # Subclasses define self.data = (X, y), or dataset/(train_set, val_set) directly
         # Be sure to include set_folds
@@ -69,18 +70,18 @@ class Data(Base):
         return td.TensorDataset(*tensors)
 
     # prefer not to use this as it doesn't apply to test set
+    # by default allow defining scikit processors
     def _fit_transforms(self, tensors):
-        def transform(t):
-            return lambda x: x
+        if self.processor is not None:
+            tensors[0] = self.processor.fit_transform(tensors[0])
+            return [lambda x: self.processor.transform(x)]
+        else:
+            return []
 
-        return tuple(transform(t) for t in tensors)
-
-    def _transform_val(self, tensors, transforms):
-        if (len_diff := len(tensors) - len(transforms)) > 0:
-            transforms = list(transforms)
-            transforms += [lambda x: x] * len_diff
-        for i, t in enumerate(tensors):
-            transforms[i](t)
+    def _transform(self, tensors, transforms):
+        for i, tt in enumerate(zip(tensors, transforms)):
+            t, tr = tt
+            tensors[i] = tr(t)
 
     def set_data(
         self,
@@ -203,7 +204,7 @@ class Data(Base):
 
                 def to_val_set(indices):
                     val_array = [row_index(a, indices) for a in self.data]
-                    self._transform_val(val_array, transforms)
+                    self._transform(val_array, transforms)
                     return self._to_dataset(val_array)
 
                 return _loaders(train_set, *(to_val_set(ixs) for ixs in split[1:]))

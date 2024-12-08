@@ -210,3 +210,21 @@ def clean_numeric(self: pl.Expr) -> pl.Expr:
             pl.Float64
         )  # Cast to Float64
     )
+
+@add_to_class(CustomExpr)
+def clean_str(self: pl.Expr) -> pl.Expr:
+    """Converts all strings to lowercase and removes all special characters.
+
+    Returns:
+        pl.Expr
+
+    Example:
+        df.with_columns(
+            pl.col("some_column").my.clean_str()
+        )
+    """
+    return (
+        self._expr.str.to_lowercase()
+    ).str.replace_all(  # Convert all characters to lowercase
+        r"[^a-z0-9\s]", ""
+    )

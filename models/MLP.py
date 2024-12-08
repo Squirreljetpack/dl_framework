@@ -10,7 +10,7 @@ class MLPConfig(Config):
     hidden_size: int = 64
     n_classes: int = 1
     dropout: float = 0  # Dropout probability
-    activation: ... = None  # ReLU
+    activation: ... = "gelu"
     test_dropout: ... = None
 
 
@@ -21,6 +21,8 @@ class MLP(Module):
             activation = nn.Sigmoid
         if c.activation == "tanh":
             activation = nn.Tanh
+        if c.activation == "gelu":
+            activation = nn.GELU
         elif c.activation == "relu":
 
             def activation():
